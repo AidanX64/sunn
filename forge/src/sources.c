@@ -21,6 +21,11 @@
 #include <sys/types.h>
 #endif
 
+/* Traversal never descends through symlinked directories (cycles and
+ * escapes: `src/link -> .` would otherwise recurse until the stack gives
+ * out), and refuses absurd nesting outright. */
+#define FORGE_SOURCES_MAX_DEPTH 64U
+
 static int source_matches_language(const char *path, ForgeSourceLanguage language)
 {
     switch (language) {
@@ -75,7 +80,8 @@ static int source_list_add(ForgeSourceList *sources, const char *path,
 
 #if FORGE_PLATFORM_WINDOWS
 static int collect_sources_recursive(const char *directory, ForgeSourceLanguage language,
-                                     ForgeSourceList *sources, char *error, size_t error_size)
+                                      ForgeSourceList *sources, unsigned depth,
+                                      char *error, size_t error_size)
 {
     WIN32_FIND_DATAA entry;
     HANDLE handle;
@@ -105,7 +111,18 @@ static int collect_sources_recursive(const char *directory, ForgeSourceLanguage 
             return -1;
         }
         if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0U) {
-            if (collect_sources_recursive(path, language, sources, error, error_size) != 0) {
+            if ((entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) {
+                continue;
+            }
+            if (depth >= FORGE_SOURCES_MAX_DEPTH) {
+                forge_util_set_error(error, error_size,
+                                     "source directory nesting too deep under '%s' "
+                                     "(symlink cycle?)", directory);
+                (void)FindClose(handle);
+                return -1;
+            }
+            if (collect_sources_recursive(path, language, sources, depth + 1U,
+                                          error, error_size) != 0) {
                 (void)FindClose(handle);
                 return -1;
             }
@@ -128,7 +145,8 @@ static int collect_sources_recursive(const char *directory, ForgeSourceLanguage 
 }
 #else
 static int collect_sources_recursive(const char *directory, ForgeSourceLanguage language,
-                                     ForgeSourceList *sources, char *error, size_t error_size)
+                                      ForgeSourceList *sources, unsigned depth,
+                                      char *error, size_t error_size)
 {
     DIR *stream;
     struct dirent *entry;
@@ -152,15 +170,37 @@ static int collect_sources_recursive(const char *directory, ForgeSourceLanguage 
             (void)closedir(stream);
             return -1;
         }
-        if (stat(path, &details) != 0) {
+        if (lstat(path, &details) != 0) {
             forge_util_set_error(error, error_size,
                                  "could not inspect source path '%s': %s", path,
                                  strerror(errno));
             (void)closedir(stream);
             return -1;
         }
+        if (S_ISLNK(details.st_mode)) {
+            /* Never descend through symlinked directories (cycles/escapes);
+             * symlinked files still resolve via stat below. Dangling links
+             * contribute nothing. */
+            struct stat target;
+
+            if (stat(path, &target) != 0) {
+                continue;
+            }
+            if (S_ISDIR(target.st_mode)) {
+                continue;
+            }
+            details = target;
+        }
         if (S_ISDIR(details.st_mode)) {
-            if (collect_sources_recursive(path, language, sources, error, error_size) != 0) {
+            if (depth >= FORGE_SOURCES_MAX_DEPTH) {
+                forge_util_set_error(error, error_size,
+                                     "source directory nesting too deep under '%s' "
+                                     "(symlink cycle?)", directory);
+                (void)closedir(stream);
+                return -1;
+            }
+            if (collect_sources_recursive(path, language, sources, depth + 1U,
+                                          error, error_size) != 0) {
                 (void)closedir(stream);
                 return -1;
             }
@@ -269,7 +309,7 @@ int forge_sources_collect(const char *project_root, const ForgeManifest *manifes
                 ++seen_count;
             }
             if (collect_sources_recursive(resolved, languages[list_index], sources,
-                                          error, error_size) != 0) {
+                                           0U, error, error_size) != 0) {
                 forge_sources_free(sources);
                 return -1;
             }

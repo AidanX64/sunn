@@ -78,8 +78,12 @@ int forge_paths_absolute(const char *path, char *destination,
 #endif
     /* Unresolvable paths keep their raw text so callers still get a usable
      * key; the stamp comparison just stays sensitive to the exact spelling. */
-    if (full[0] == '\0' && snprintf(full, sizeof(full), "%s", path) < 0) {
-        return -1;
+    if (full[0] == '\0') {
+        int written = snprintf(full, sizeof(full), "%s", path);
+
+        if (written < 0 || (size_t)written >= sizeof(full)) {
+            return -1;
+        }
     }
     if (strlen(full) >= destination_size) {
         return -1;

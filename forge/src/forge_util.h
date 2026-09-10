@@ -7,6 +7,15 @@
 /* Fills `error` (if there is room) with a formatted message. */
 void forge_util_set_error(char *error, size_t error_size, const char *format, ...);
 
+/*
+ * Prepends a formatted prefix to the message already in `error`, truncating
+ * the old tail when it no longer fits. Use this instead of
+ * `set_error(buf, "...%s...", buf)`: passing the same buffer as both the
+ * destination and a %s source is undefined behaviour for vsnprintf and
+ * garbles the message on several libcs.
+ */
+void forge_util_prepend_error(char *error, size_t error_size, const char *format, ...);
+
 /* Strips leading and trailing whitespace from *text in place, returning text. */
 char *forge_util_trim(char *text);
 

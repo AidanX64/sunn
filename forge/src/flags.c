@@ -68,6 +68,9 @@ static int append_std_msvc(ForgeArgv *argv, const char *std_version,
 {
     const char *flag;
 
+    if (std_version[0] == '\0') {
+        return 0;
+    }
     if (strcmp(std_version, "c11") == 0) {
         flag = "/std:c11";
     } else if (strcmp(std_version, "c17") == 0) {

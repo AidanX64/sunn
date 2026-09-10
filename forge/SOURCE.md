@@ -7,7 +7,7 @@ edit upstream and re-sync.
 - Upstream path: `C:\Users\dooms\source\forge`
 - Upstream HEAD: `dc66b09c3bc09d481793fc4276ec69c5ca09f3f2`
 - Upstream status at copy time: dirty (see below)
-- Copied: 2026-09-10 (robocopy, working tree)
+- Copied: 2026-09-09 (robocopy, working tree)
 - Excluded from copy: `.git/`, `build/`, `target/`, `test/target/`, `*.exe`, `*.o`, `*.obj`, `*.a`, `*.lib`, `.scratch/`, `.opencode/`, `examples/`
 
 Upstream `git status --short` at copy time:
@@ -21,15 +21,22 @@ M include/forge/deps.h
 M include/forge/manifest.h
 M include/forge/orchestrator.h
 M include/forge/pkg.h
+M src/argv.c
 M src/cli.c
 M src/commands.c
 M src/compiler.c
 M src/deps.c
 M src/fingerprint.c
+M src/flags.c
+M src/forge_util.c
+M src/forge_util.h
 M src/log.c
 M src/manifest.c
 M src/orchestrator.c
+M src/paths.c
 M src/pkg.c
+M src/scaffold.c
+M src/sources.c
 M test/deps-regression.sh
 ?? include/forge/fetch.h
 ?? include/forge/registry.h

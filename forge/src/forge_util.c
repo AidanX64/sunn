@@ -34,6 +34,33 @@ void forge_util_set_error(char *error, size_t error_size, const char *format, ..
     va_end(arguments);
 }
 
+void forge_util_prepend_error(char *error, size_t error_size, const char *format, ...)
+{
+    char prefix[1024U];
+    size_t prefix_length;
+    size_t old_length;
+    va_list arguments;
+
+    if (error == NULL || error_size == 0U) {
+        return;
+    }
+    va_start(arguments, format);
+    (void)vsnprintf(prefix, sizeof(prefix), format, arguments);
+    va_end(arguments);
+    prefix_length = strlen(prefix);
+    if (prefix_length >= error_size) {
+        (void)snprintf(error, error_size, "%s", prefix);
+        return;
+    }
+    old_length = strlen(error);
+    if (prefix_length + old_length + 1U > error_size) {
+        old_length = error_size - prefix_length - 1U;
+    }
+    /* memmove (not memcpy/strcpy) is defined for overlapping regions. */
+    (void)memmove(error + prefix_length, error, old_length + 1U);
+    (void)memcpy(error, prefix, prefix_length);
+}
+
 char *forge_util_trim(char *text)
 {
     char *end;

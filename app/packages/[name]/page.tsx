@@ -4,7 +4,9 @@ import { promises as fs } from "fs"
 import { notFound } from "next/navigation"
 import {
   nativePackageSchema,
+  packageNameSchema,
   registryIndexSchema,
+  resolvePublicFile,
 } from "@/lib/sunn-registry"
 import {
   Card,
@@ -20,6 +22,7 @@ export default async function PackageDetailPage({
   params: Promise<{ name: string }>
 }) {
   const { name } = await params
+  if (!packageNameSchema.safeParse(name).success) notFound()
   try {
     const indexPath = path.join(
       process.cwd(),
@@ -32,10 +35,14 @@ export default async function PackageDetailPage({
     )
     const entry = index.packages.find((p) => p.name === name)
     if (!entry) notFound()
-    const pkgPath = path.join(process.cwd(), "public", entry.index.replace(/^\//, ""))
+    const pkgPath = resolvePublicFile(entry.index)
+    if (!pkgPath) throw new Error(`bad index pointer for ${entry.name}`)
     const pkg = nativePackageSchema.parse(
       JSON.parse(await fs.readFile(pkgPath, "utf8"))
     )
+    if (pkg.name !== entry.name || pkg.version !== entry.latest) {
+      throw new Error(`registry drift for ${entry.name}`)
+    }
 
     const forgeCmd = `forge add ${pkg.name} --git https://sunn.local/packages/${pkg.name}`
     const vcpkgCmd = pkg.vcpkg ? `vcpkg add port ${pkg.vcpkg.port}` : "# no vcpkg port mapped yet"

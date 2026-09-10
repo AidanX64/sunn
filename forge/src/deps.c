@@ -16,6 +16,7 @@
 #if FORGE_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <fcntl.h>
 #include <io.h>
 #else
 #include <fcntl.h>
@@ -35,6 +36,7 @@
 #define FORGE_DEPS_VALUE_MAX FORGE_MANIFEST_VALUE_MAX
 #define FORGE_LOCK_MAX_ENTRIES FORGE_MANIFEST_MAX_DEPS
 #define FORGE_SCAN_ENTRY_LIMIT 20000U
+#define FORGE_SCAN_MAX_DEPTH 64U
 #define FORGE_LOCK_LINE_MAX 4096U
 
 /* One pinned dependency as recorded in Forge.lock: git entries pin a
@@ -253,6 +255,102 @@ static int scheme_matches(const char *url, size_t length, const char *name)
  *
  * Everything else is refused loudly rather than handed to git.
  */
+/* Validates the authority section of an https:// or ssh:// URL so a crafted
+ * host cannot turn into an ssh option: `ssh://-oProxyCommand=.../x` would
+ * otherwise reach `git clone` (a lone argv element, so no shell is involved)
+ * and git would hand the `-o...` host to ssh as a command-line flag.
+ * Grammar: [user@]host[:port], host non-empty, never starting with '-'. */
+static int url_authority_is_safe(const char *url, size_t scheme_length)
+{
+    const char *cursor = url + scheme_length;
+    const char *host;
+    const char *end;
+
+    /* Skip "://". */
+    if (cursor[0] != ':' || cursor[1] != '/' || cursor[2] != '/') {
+        return 0;
+    }
+    cursor += 3U;
+    /* Strip optional userinfo: [user@]. */
+    for (end = cursor; *end != '\0' && *end != '/' && *end != '?' && *end != '#'; ++end) {
+        if (*end == '@') {
+            const char *user;
+
+            for (user = cursor; user < end; ++user) {
+                unsigned char c = (unsigned char)*user;
+
+                if (!(isalnum(c) || c == '.' || c == '-' || c == '_' ||
+                      c == '~' || c == '+')) {
+                    return 0;
+                }
+            }
+            cursor = end + 1;
+            break;
+        }
+    }
+    host = cursor;
+    if (host[0] == '[') {
+        /* Bracketed IPv6 literal: [::1], optionally followed by :port. */
+        const char *close = strchr(host, ']');
+        const char *port;
+
+        if (close == NULL || close == host + 1U) {
+            return 0;
+        }
+        for (cursor = host + 1U; cursor < close; ++cursor) {
+            unsigned char c = (unsigned char)*cursor;
+
+            if (!(isxdigit(c) || c == ':' || c == '.')) {
+                return 0;
+            }
+        }
+        if (*close == ']' && close[1] != ':' && close[1] != '\0' &&
+            close[1] != '/' && close[1] != '?' && close[1] != '#') {
+            return 0;
+        }
+        if (close[1] != ':') {
+            return 1;
+        }
+        port = close + 2U;
+        if (*port == '\0') {
+            return 0;
+        }
+        for (; *port != '\0' && *port != '/' && *port != '?' && *port != '#'; ++port) {
+            if (!isdigit((unsigned char)*port)) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+    for (end = host; *end != '\0' && *end != '/' && *end != '?' && *end != '#'; ++end) {
+        if (*end == ':') {
+            /* Port: digits only, non-empty. */
+            const char *port = end + 1;
+
+            if (*port == '\0') {
+                return 0;
+            }
+            for (; *port != '\0' && *port != '/' && *port != '?' && *port != '#'; ++port) {
+                if (!isdigit((unsigned char)*port)) {
+                    return 0;
+                }
+            }
+            break;
+        }
+    }
+    if (end == host || host[0] == '-') {
+        return 0;
+    }
+    for (; host < end; ++host) {
+        unsigned char c = (unsigned char)*host;
+
+        if (!(isalnum(c) || c == '.' || c == '-' || c == '_')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int forge_deps_git_url_is_supported(const char *url, char *error, size_t error_size)
 {
     static const char *const rejection =
@@ -302,6 +400,12 @@ int forge_deps_git_url_is_supported(const char *url, char *error, size_t error_s
          * schemes bypass the cache policy, http:// clones insecurely. */
         if ((scheme_length == 5U && scheme_matches(url, scheme_length, "https")) ||
             (scheme_length == 3U && scheme_matches(url, scheme_length, "ssh"))) {
+            if (!url_authority_is_safe(url, scheme_length)) {
+                forge_util_set_error(error, error_size,
+                          "git URL '%s' has an unusable host; %s", url,
+                          rejection);
+                return -1;
+            }
             return 0;
         }
         forge_util_set_error(error, error_size,
@@ -1335,10 +1439,9 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                 return -1;
             }
             if (forge_paths_ensure_directory(package_dir, context->error,
-                                             sizeof(context->error)) != 0) {
-                forge_util_set_error(context->error, sizeof(context->error),
-                          "cannot resolve '%s': %s", dependency->name,
-                          context->error);
+                                              sizeof(context->error)) != 0) {
+                forge_util_prepend_error(context->error, sizeof(context->error),
+                          "cannot resolve '%s': ", dependency->name);
                 return -1;
             }
             /* M6 gate, same as git checkouts: one writer per package dir. */
@@ -1440,9 +1543,8 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                                      cache_home, "git") != 0 ||
                     forge_paths_ensure_directory(cache_git_root, context->error,
                                                  sizeof(context->error)) != 0) {
-                    forge_util_set_error(context->error, sizeof(context->error),
-                              "cannot resolve '%s': %s", dependency->name,
-                              context->error);
+                    forge_util_prepend_error(context->error, sizeof(context->error),
+                              "cannot resolve '%s': ", dependency->name);
                     return -1;
                 }
             }
@@ -1517,8 +1619,8 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                                  "Forge.toml") != 0 ||
                 forge_manifest_load(manifest_path, parsed, context->error,
                                     sizeof(context->error)) != 0) {
-                forge_util_set_error(context->error, sizeof(context->error),
-                          "dependency '%s': %s", dependency->name, context->error);
+                forge_util_prepend_error(context->error, sizeof(context->error),
+                          "dependency '%s': ", dependency->name);
                 free(parsed);
                 return -1;
             }
@@ -1743,10 +1845,13 @@ static int has_static_lib_suffix(const char *name)
  * Depth-first search of `dir` for the first static library. Returns 1 when
  * one was copied into `found`, 0 when none was found, -1 on a hard error.
  * Generated/build directories that never hold the final artifact are pruned
- * to keep the scan bounded by `budget` entries.
+ * to keep the scan bounded by `budget` entries. Symlinks are never followed:
+ * a dependency containing `build -> /usr/lib` must not resolve its artifact
+ * outside its own root (nor loop forever), so linked entries are skipped and
+ * nesting past FORGE_SCAN_MAX_DEPTH is a hard error.
  */
 static int scan_dir_for_static_lib(const char *dir, char *found, size_t found_size,
-                                   unsigned *budget)
+                                    unsigned *budget, unsigned depth)
 {
 #if FORGE_PLATFORM_WINDOWS
     WIN32_FIND_DATAA entry;
@@ -1759,6 +1864,9 @@ static int scan_dir_for_static_lib(const char *dir, char *found, size_t found_si
 
     if (*budget == 0U) {
         return 0;
+    }
+    if (depth >= FORGE_SCAN_MAX_DEPTH) {
+        return -1;
     }
     --*budget;
 #if FORGE_PLATFORM_WINDOWS
@@ -1780,13 +1888,17 @@ static int scan_dir_for_static_lib(const char *dir, char *found, size_t found_si
             (void)FindClose(handle);
             return -1;
         }
+        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) {
+            continue;
+        }
         if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0U) {
             if (strcmp(entry.cFileName, "CMakeFiles") == 0 ||
                 strcmp(entry.cFileName, ".git") == 0 ||
                 strcmp(entry.cFileName, "target") == 0) {
                 continue;
             }
-            status = scan_dir_for_static_lib(child, found, found_size, budget);
+            status = scan_dir_for_static_lib(child, found, found_size, budget,
+                                             depth + 1U);
             if (status != 0) {
                 (void)FindClose(handle);
                 return status;
@@ -1824,7 +1936,10 @@ static int scan_dir_for_static_lib(const char *dir, char *found, size_t found_si
             (void)closedir(stream);
             return -1;
         }
-        if (stat(child, &details) != 0) {
+        if (lstat(child, &details) != 0) {
+            continue;
+        }
+        if (S_ISLNK(details.st_mode)) {
             continue;
         }
         if (S_ISDIR(details.st_mode)) {
@@ -1833,7 +1948,8 @@ static int scan_dir_for_static_lib(const char *dir, char *found, size_t found_si
                 strcmp(item->d_name, "target") == 0) {
                 continue;
             }
-            status = scan_dir_for_static_lib(child, found, found_size, budget);
+            status = scan_dir_for_static_lib(child, found, found_size, budget,
+                                             depth + 1U);
             if (status != 0) {
                 (void)closedir(stream);
                 return status;
@@ -1868,7 +1984,8 @@ static int find_static_artifact(const char *root, char *artifact, size_t artifac
                              search_dirs[index]) != 0) {
             continue;
         }
-        status = scan_dir_for_static_lib(candidate, artifact, artifact_size, &budget);
+        status = scan_dir_for_static_lib(candidate, artifact, artifact_size, &budget,
+                                             0U);
         if (status < 0) {
             forge_util_set_error(error, error_size,
                       "could not search '%s' for a built library", candidate);
@@ -1887,6 +2004,63 @@ static int find_static_artifact(const char *root, char *artifact, size_t artifac
 
 #define FORGE_SCRIPTS_MARKER ".forge-scripts-approved"
 
+/* True only for a genuine regular file: symlinks (and Windows reparse
+ * points) never count, so a dependency cannot smuggle approval past the
+ * prompt with a marker link, nor redirect the approval write at a victim. */
+static int marker_is_approved(const char *path)
+{
+#if FORGE_PLATFORM_WINDOWS
+    DWORD attributes = GetFileAttributesA(path);
+
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0U &&
+           (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0U;
+#else
+    struct stat details;
+
+    return lstat(path, &details) == 0 && S_ISREG(details.st_mode);
+#endif
+}
+
+/* Records approval atomically: O_CREAT|O_EXCL (plus O_NOFOLLOW where the
+ * platform has it) so a concurrently planted link can neither divert the
+ * write nor slip past the check above. Returns 0 when the marker exists
+ * afterwards as a genuine file, -1 otherwise. */
+static int marker_record_approval(const char *path)
+{
+#if FORGE_PLATFORM_WINDOWS
+    int fd = _open(path, _O_WRONLY | _O_CREAT | _O_EXCL,
+                   _S_IREAD | _S_IWRITE);
+#else
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+#endif
+    FILE *file;
+
+    if (fd < 0) {
+        return marker_is_approved(path) ? 0 : -1;
+    }
+#if FORGE_PLATFORM_WINDOWS
+    file = _fdopen(fd, "w");
+#else
+    file = fdopen(fd, "w");
+#endif
+    if (file == NULL) {
+#if FORGE_PLATFORM_WINDOWS
+        _close(fd);
+#else
+        (void)close(fd);
+#endif
+        (void)remove(path);
+        return -1;
+    }
+    (void)fputs("approved\n", file);
+    if (fclose(file) != 0) {
+        (void)remove(path);
+        return -1;
+    }
+    return 0;
+}
+
 /*
  * Building a foreign dependency runs its cmake/make scripts — third-party
  * code execution on every build. Gate the first run behind an explicit
@@ -1899,12 +2073,11 @@ static int find_static_artifact(const char *root, char *artifact, size_t artifac
  *                                      clone so a fresh clone re-asks.
  */
 static int build_scripts_allowed(ForgeLogger *logger, const char *dependency_name,
-                                 const char *dependency_root, const char *kind,
-                                 char *error, size_t error_size)
+                                  const char *dependency_root, const char *kind,
+                                  char *error, size_t error_size)
 {
     const char *override = getenv("FORGE_ALLOW_DEP_BUILD_SCRIPTS");
     char marker_path[FORGE_PATH_MAX];
-    FILE *answer_file;
 
     if (override != NULL && override[0] != '\0') {
         if (strcmp(override, "0") == 0) {
@@ -1921,7 +2094,7 @@ static int build_scripts_allowed(ForgeLogger *logger, const char *dependency_nam
         forge_util_set_error(error, error_size, "dependency path is too long");
         return -1;
     }
-    if (file_exists(marker_path)) {
+    if (marker_is_approved(marker_path)) {
         return 0;
     }
 #if FORGE_PLATFORM_WINDOWS
@@ -1954,12 +2127,10 @@ static int build_scripts_allowed(ForgeLogger *logger, const char *dependency_nam
             return -1;
         }
     }
-    /* Record the decision so later builds of this checkout stay quiet. */
-    answer_file = fopen(marker_path, "w");
-    if (answer_file != NULL) {
-        (void)fputs("approved\n", answer_file);
-        (void)fclose(answer_file);
-    } else {
+    /* Record the decision so later builds of this checkout stay quiet. A
+     * pre-existing genuine marker (won race) is approval too; anything else
+     * keeps the prompt for next time. */
+    if (marker_record_approval(marker_path) != 0) {
         deps_log(logger, "deps",
                  "could not record script approval for '%s'; it will be "
                  "requested again", dependency_name);

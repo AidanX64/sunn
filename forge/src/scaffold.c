@@ -139,8 +139,8 @@ static int scaffold_into(const char *project_dir, const char *project_name,
     }
     /* The generated manifest must satisfy forge's own strict parser. */
     if (forge_manifest_load(manifest_path, &parsed, error, error_size) != 0) {
-        forge_util_set_error(error, error_size,
-                             "generated manifest failed validation: %s", error);
+        forge_util_prepend_error(error, error_size,
+                                 "generated manifest failed validation: ");
         return -1;
     }
     return 0;

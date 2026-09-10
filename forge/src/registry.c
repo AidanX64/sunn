@@ -792,15 +792,24 @@ int forge_registry_query(ForgeLogger *logger, const char *package,
         return query_file_registry(base, package, version, triplet, pin,
                                    error, error_size);
     }
-    if ((version != NULL && version[0] != '\0' &&
-         snprintf(url, sizeof(url), "%s/api/forge/v1/resolve?name=%s&version=%s&triplet=%s",
-                  base, package, version, triplet) < 0) ||
-        ((version == NULL || version[0] == '\0') &&
-         snprintf(url, sizeof(url), "%s/api/forge/v1/resolve?name=%s&triplet=%s",
-                  base, package, triplet) < 0) ||
-        strlen(base) + 64U + strlen(package) >= sizeof(url)) {
-        forge_util_set_error(error, error_size, "registry query URL is too long");
-        return -1;
+    /* snprintf truncations are detected via the would-be length: a silently
+     * shortened query URL would resolve the wrong package. */
+    {
+        int written;
+
+        if (version != NULL && version[0] != '\0') {
+            written = snprintf(url, sizeof(url),
+                               "%s/api/forge/v1/resolve?name=%s&version=%s&triplet=%s",
+                               base, package, version, triplet);
+        } else {
+            written = snprintf(url, sizeof(url),
+                               "%s/api/forge/v1/resolve?name=%s&triplet=%s",
+                               base, package, triplet);
+        }
+        if (written < 0 || (size_t)written >= sizeof(url)) {
+            forge_util_set_error(error, error_size, "registry query URL is too long");
+            return -1;
+        }
     }
     /* The endpoint URL is built from validated pieces, but run it through
      * the same transport policy as artifact downloads anyway. */
@@ -1049,7 +1058,7 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
              * byte-identical or the next load fails its own gate. */
             (void)snprintf(pin->url, sizeof(pin->url), "%s",
                            effective_lock_url);
-            if (snprintf(root_out, root_size, "%s", version_dir) < 0) {
+            if ((size_t)snprintf(root_out, root_size, "%s", version_dir) >= root_size) {
                 forge_util_set_error(error, error_size, "registry cache path is too long");
                 return -1;
             }
@@ -1098,7 +1107,7 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
         read_pin_marker(version_dir, marker, sizeof(marker));
         if (strcmp(marker, pin->sha256) == 0 &&
             directory_has_source(version_dir)) {
-            if (snprintf(root_out, root_size, "%s", version_dir) < 0) {
+            if ((size_t)snprintf(root_out, root_size, "%s", version_dir) >= root_size) {
                 forge_util_set_error(error, error_size, "registry cache path is too long");
                 return -1;
             }
@@ -1156,7 +1165,7 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
     }
     forge_logger_detail(logger, "deps", "resolved %s %s", package,
                             pin->version);
-    if (snprintf(root_out, root_size, "%s", version_dir) < 0) {
+    if ((size_t)snprintf(root_out, root_size, "%s", version_dir) >= root_size) {
         forge_util_set_error(error, error_size, "registry cache path is too long");
         return -1;
     }

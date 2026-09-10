@@ -119,9 +119,15 @@ int forge_argv_join(char *destination, size_t destination_size, const ForgeArgv 
             }
             destination[length++] = ' ';
         }
-        if (snprintf(destination + length, destination_size - length, "%s",
-                     argv->items[index]) < 0) {
-            return -1;
+        {
+            int written = snprintf(destination + length, destination_size - length,
+                                   "%s", argv->items[index]);
+
+            /* A truncated display would hash/log a different command than the
+             * one that runs (stale-build risk), so report it instead. */
+            if (written < 0 || (size_t)written >= destination_size - length) {
+                return -1;
+            }
         }
         length = strlen(destination);
     }

@@ -152,6 +152,7 @@ static int command_stamp_matches(const char *object_path, unsigned int command_h
     char path[FORGE_PATH_MAX];
     FILE *stream;
     unsigned int recorded = 0U;
+    char terminator = '\0';
     int matched;
 
     if (command_stamp_path(object_path, path, sizeof(path)) != 0) {
@@ -163,7 +164,11 @@ static int command_stamp_matches(const char *object_path, unsigned int command_h
          * exactly once — the same contract as objects without depfiles. */
         return 0;
     }
-    matched = fscanf(stream, "%x", &recorded) == 1 && recorded == command_hash;
+    /* Strict: the writer emits "%08x\n", so trailing garbage ("12xx") or a
+     * truncated stamp must not count as a match — the object recompiles. */
+    matched = fscanf(stream, "%8x%c", &recorded, &terminator) == 2 &&
+              terminator == '\n' && recorded == command_hash &&
+              fgetc(stream) == EOF;
     (void)fclose(stream);
     return matched;
 }
@@ -304,7 +309,10 @@ static int depfile_has_stale_dependency(FILE *stream, const char *object_path)
                 token[token_length++] = (char)character;
             }
             if (next != EOF && ungetc(next, stream) == EOF) {
-                return 0;
+                /* Cannot push the lookahead back: the token stream is
+                 * unreliable, so treat the object as stale (recompile)
+                 * rather than trusting a partial read as fresh. */
+                return 1;
             }
             continue;
         }

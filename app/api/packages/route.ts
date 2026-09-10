@@ -4,6 +4,7 @@ import { promises as fs } from "fs"
 import {
   nativePackageSchema,
   registryIndexSchema,
+  resolvePublicFile,
 } from "@/lib/sunn-registry"
 
 async function loadIndex() {
@@ -13,9 +14,9 @@ async function loadIndex() {
 }
 
 async function loadPackage(indexPath: string) {
-  // indexPath looks like /packages/hello-c/0.1.0.json
-  const rel = indexPath.replace(/^\//, "")
-  const filePath = path.join(process.cwd(), "public", rel)
+  // indexPath looks like /packages/hello-c/0.1.0.json — never join blindly.
+  const filePath = resolvePublicFile(indexPath)
+  if (!filePath) throw new Error(`bad index pointer: ${indexPath}`)
   const raw = await fs.readFile(filePath, "utf8")
   return nativePackageSchema.parse(JSON.parse(raw))
 }
@@ -29,7 +30,13 @@ export async function GET(request: Request) {
     const triplet = searchParams.get("triplet")
 
     const index = await loadIndex()
-    const pkgs = await Promise.all(index.packages.map((p) => loadPackage(p.index)))
+    // One corrupt package must not take down the whole catalog.
+    const settled = await Promise.allSettled(index.packages.map((p) => loadPackage(p.index)))
+    const pkgs = settled.flatMap((r) => {
+      if (r.status === "fulfilled") return [r.value]
+      console.error("Skipping corrupt native package:", r.reason)
+      return []
+    })
 
     const filtered = pkgs.filter((p) => {
       if (q && !`${p.name} ${p.description}`.toLowerCase().includes(q)) return false

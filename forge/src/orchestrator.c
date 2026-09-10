@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -142,6 +143,9 @@ static int text_builder_add(ForgeTextBuilder *builder, const char *line)
         char *grown;
 
         while (builder->length + line_length + 1U > new_capacity) {
+            if (new_capacity > SIZE_MAX / 2U) {
+                return -1;
+            }
             new_capacity *= 2U;
         }
         grown = realloc(builder->text, new_capacity);
@@ -1345,6 +1349,7 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
                                 (const char *const *)dep_link_inputs.items,
                                 dep_link_inputs.count) != 0) {
             print_error("out of memory while recording link inputs");
+            text_builder_free(&expected_stamp);
             goto cleanup;
         }
         fresh = link_is_fresh(executable_path, stamp_path, &expected_stamp,
@@ -1373,10 +1378,11 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
                                           sources.count,
                                           (const char *const *)dep_link_inputs.items,
                                           dep_link_inputs.count, executable_path,
-                                          profile_directory, profile, &argv,
-                                          &used_response_file, error,
-                                          sizeof(error)) != 0) {
+                                           profile_directory, profile, &argv,
+                                           &used_response_file, error,
+                                           sizeof(error)) != 0) {
             print_error("%s", error);
+            text_builder_free(&expected_stamp);
             goto cleanup;
         }
         forge_logger_detail(active_logger, "link", "----- link %s -----", executable_path);
@@ -1463,6 +1469,11 @@ cleanup:
         }
     }
     free(context.commands);
+    if (context.command_displays != NULL) {
+        for (source_index = 0U; source_index < context.count; ++source_index) {
+            free(context.command_displays[source_index]);
+        }
+    }
     free(context.command_displays);
     free(context.command_hashes);
     free(object_references);

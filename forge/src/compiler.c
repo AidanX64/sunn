@@ -291,28 +291,57 @@ int forge_compiler_select(const ForgeHostInfo *host, const char *override_progra
  * not pull in the C++ standard library, only their g++/clang++ counterparts
  * do. Versioned programs map along ("gcc-13" -> "g++-13", written into
  * `buffer`); anything already carrying "++", or unrecognizable, is passed
- * through unchanged.
+ * through unchanged. Absolute paths ("C:\llvm\bin\clang.exe",
+ * "/usr/bin/gcc-13") match on their basename but keep the directory.
  */
 static const char *cpp_driver(const ForgeCompiler *compiler,
                               char *buffer, size_t buffer_size)
 {
     const char *program = compiler->program;
+    const char *slash = strrchr(program, '/');
+    const char *backslash = strrchr(program, '\\');
+    const char *base = program;
+    const char *name;
     const char *prefix = NULL;
     const char *rest = NULL;
 
-    if (strstr(program, "++") == NULL) {
-        if (strncmp(program, "gcc", 3U) == 0) {
+    if (slash != NULL && slash + 1U > base) {
+        base = slash + 1U;
+    }
+    if (backslash != NULL && backslash + 1U > base) {
+        base = backslash + 1U;
+    }
+    name = base;
+    if (strstr(name, "++") == NULL) {
+        const char *tail = NULL;
+
+        if (strncmp(name, "gcc", 3U) == 0) {
             prefix = "g++";
-            rest = program + 3U;
-        } else if (strncmp(program, "clang", 5U) == 0) {
+            tail = name + 3U;
+        } else if (strncmp(name, "clang", 5U) == 0) {
             prefix = "clang++";
-            rest = program + 5U;
+            tail = name + 5U;
+        }
+        /* Only version/extension tails map along ("-13", ".exe", "");
+         * variants like "clang-cl" or wrappers like "gccache" pass through
+         * rather than producing a nonsense driver name. */
+        if (tail == NULL || !(tail[0] == '\0' || tail[0] == '.' ||
+                              isdigit((unsigned char)tail[0]) ||
+                              (tail[0] == '-' && isdigit((unsigned char)tail[1])))) {
+            prefix = NULL;
+            tail = NULL;
+        } else {
+            rest = tail;
         }
     }
     if (prefix == NULL) {
         return program;
     }
-    (void)snprintf(buffer, buffer_size, "%s%s", prefix, rest);
+    if ((size_t)snprintf(buffer, buffer_size, "%.*s%s%s",
+                         (int)(size_t)(name - program), program,
+                         prefix, rest) >= buffer_size) {
+        return program;
+    }
     return buffer;
 }
 
@@ -528,7 +557,9 @@ int forge_compiler_make_compile_argv(const ForgeCompiler *compiler,
 #define FORGE_LINK_RESPONSE_LIMIT 28000U
 
 /* Writes the non-program tail of a link argv into a compiler response file,
- * using forward slashes so both GCC/Clang and MSVC parse the paths. */
+ * using forward slashes so both GCC/Clang and MSVC parse the paths. Every
+ * character write is checked: on ENOSPC an unchecked partial file would
+ * surface later as cryptic linker errors. */
 static int write_response_file(const char *path, const ForgeArgv *argv,
                                char *error, size_t error_size)
 {
@@ -543,26 +574,45 @@ static int write_response_file(const char *path, const ForgeArgv *argv,
     for (index = 1U; index < argv->count; ++index) {
         const char *cursor;
         if (argv->items[index] == NULL) {
-            break;
+            forge_util_set_error(error, error_size,
+                      "could not write response file '%s': link argument is missing", path);
+            (void)fclose(stream);
+            (void)remove(path);
+            return -1;
         }
-        (void)fputc('"', stream);
+        if (fputc('"', stream) == EOF) {
+            goto write_failed;
+        }
         for (cursor = argv->items[index]; *cursor != '\0'; ++cursor) {
             if (*cursor == '"') {
-                (void)fputc('\\', stream);
-                (void)fputc('"', stream);
+                if (fputc('\\', stream) == EOF || fputc('"', stream) == EOF) {
+                    goto write_failed;
+                }
             } else if (*cursor == '\\') {
-                (void)fputc('/', stream);
+                if (fputc('/', stream) == EOF) {
+                    goto write_failed;
+                }
             } else {
-                (void)fputc(*cursor, stream);
+                if (fputc(*cursor, stream) == EOF) {
+                    goto write_failed;
+                }
             }
         }
-        (void)fputs("\"\n", stream);
+        if (fputs("\"\n", stream) == EOF) {
+            goto write_failed;
+        }
     }
     if (fclose(stream) != 0) {
         forge_util_set_error(error, error_size, "could not finish response file '%s'", path);
+        (void)remove(path);
         return -1;
     }
     return 0;
+write_failed:
+    forge_util_set_error(error, error_size, "could not write response file '%s'", path);
+    (void)fclose(stream);
+    (void)remove(path);
+    return -1;
 }
 
 int forge_compiler_make_link_argv(const ForgeCompiler *compiler,

@@ -3,7 +3,11 @@ import path from "path"
 import { promises as fs } from "fs"
 import {
   nativePackageSchema,
+  packageNameSchema,
+  packageVersionSchema,
   registryIndexSchema,
+  resolvePublicFile,
+  tripletSchema,
 } from "@/lib/sunn-registry"
 
 // GET /api/forge/v1/resolve?name=hello-c&version=0.1.0&triplet=x64-windows
@@ -14,8 +18,14 @@ export async function GET(request: Request) {
     const name = searchParams.get("name")
     const version = searchParams.get("version")
     const triplet = searchParams.get("triplet")
-    if (!name) {
-      return NextResponse.json({ error: "Missing ?name=" }, { status: 400 })
+    if (!name || !packageNameSchema.safeParse(name).success) {
+      return NextResponse.json({ error: "Missing or invalid ?name=" }, { status: 400 })
+    }
+    if (version !== null && !packageVersionSchema.safeParse(version).success) {
+      return NextResponse.json({ error: "Invalid ?version=" }, { status: 400 })
+    }
+    if (triplet !== null && !tripletSchema.safeParse(triplet).success) {
+      return NextResponse.json({ error: "Invalid ?triplet=" }, { status: 400 })
     }
 
     const indexPath = path.join(process.cwd(), "public", "packages", "sunn.registry.json")
@@ -32,8 +42,16 @@ export async function GET(request: Request) {
         { status: 404 }
       )
     }
-    const pkgPath = path.join(process.cwd(), "public", entry.index.replace(/^\//, ""))
+    const pkgPath = resolvePublicFile(entry.index)
+    if (!pkgPath) {
+      console.error(`Corrupt registry index pointer for package ${entry.name}`)
+      return NextResponse.json({ error: "Something went wrong" }, { status: 500 })
+    }
     const pkg = nativePackageSchema.parse(JSON.parse(await fs.readFile(pkgPath, "utf8")))
+    if (pkg.name !== entry.name || pkg.version !== entry.latest) {
+      console.error(`Registry drift: index points ${entry.name}@${entry.latest} at ${entry.index}`)
+      return NextResponse.json({ error: "Something went wrong" }, { status: 500 })
+    }
 
     const artifact = triplet
       ? pkg.artifacts.find((a) => a.triplet === triplet) ?? null

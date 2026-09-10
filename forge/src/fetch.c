@@ -273,11 +273,206 @@ int forge_fetch_to_file(ForgeLogger *logger, const char *url,
     return -1;
 }
 
+/* Tar-slip guard: registry tarballs are fetched from the network, so every
+ * member must stay inside the destination directory. One `tar -t` line per
+ * member: relative, no drive/UNC prefix, no backslash separators (ambiguous
+ * on Windows), and no ".." segment. Anything else fails the unpack before
+ * anything is extracted. */
+static int tar_member_is_safe(const char *member)
+{
+    const char *segment;
+    size_t length;
+
+    if (member == NULL || member[0] == '\0') {
+        return 0;
+    }
+    if (member[0] == '/' || member[0] == '\\') {
+        return 0;
+    }
+    if (((member[0] >= 'A' && member[0] <= 'Z') ||
+         (member[0] >= 'a' && member[0] <= 'z')) && member[1] == ':') {
+        return 0;
+    }
+    for (segment = member; *segment != '\0'; ++segment) {
+        if (*segment == '\\') {
+            return 0;
+        }
+    }
+    for (segment = member;;) {
+        const char *slash = strchr(segment, '/');
+
+        length = slash == NULL ? strlen(segment) : (size_t)(slash - segment);
+        if (length == 2U && segment[0] == '.' && segment[1] == '.') {
+            return 0;
+        }
+        if (slash == NULL) {
+            return 1;
+        }
+        segment = slash + 1U;
+    }
+}
+
+/* Runs `tar -t[z]f <archive>` (plus -v for the type listing), capturing the
+ * listing to `list_path` for validation. */
+static int tar_capture_listing(ForgeLogger *logger, const char *archive,
+                               const char *list_path, int verbose,
+                               char *error, size_t error_size)
+{
+    ForgeArgv argv = {0};
+    int exit_code = 0;
+    int status;
+
+    (void)logger;
+    if (forge_argv_append(&argv, "tar") != 0 ||
+        forge_argv_append(&argv, verbose ? "-tvzf" : "-tzf") != 0 ||
+        forge_argv_append(&argv, archive) != 0) {
+        forge_argv_free(&argv);
+        forge_util_set_error(error, error_size,
+                  "out of memory while building a tar command");
+        return -1;
+    }
+    if (forge_argv_finalize(&argv) != 0) {
+        forge_argv_free(&argv);
+        forge_util_set_error(error, error_size,
+                  "out of memory while building a tar command");
+        return -1;
+    }
+    status = forge_process_run(argv.items, list_path, 0, &exit_code, error,
+                               error_size);
+    forge_argv_free(&argv);
+    if (status != 0) {
+        return -1;
+    }
+    if (exit_code != 0) {
+        forge_util_set_error(error, error_size,
+                  "tar failed to list '%s' (exit %d); refusing to unpack",
+                  archive, exit_code);
+        return -1;
+    }
+    return 0;
+}
+
+#define FORGE_TAR_LIST_MAX_LINES 65536U
+
+/* Reads one captured line; returns 1 with the newline stripped, 0 at EOF,
+ * -1 on an overlong line or I/O error. */
+static int read_listing_line(FILE *stream, char *line, size_t line_size,
+                             char *error, size_t error_size)
+{
+    size_t length;
+
+    if (fgets(line, (int)line_size, stream) == NULL) {
+        if (ferror(stream)) {
+            forge_util_set_error(error, error_size,
+                      "could not read tar listing");
+            return -1;
+        }
+        return 0;
+    }
+    length = strlen(line);
+    if (length == line_size - 1U && line[length - 1U] != '\n') {
+        forge_util_set_error(error, error_size,
+                  "tar listing has an overlong entry; refusing to unpack");
+        return -1;
+    }
+    while (length != 0U && (line[length - 1U] == '\n' || line[length - 1U] == '\r')) {
+        line[--length] = '\0';
+    }
+    return 1;
+}
+
+static int validate_member_listing(const char *list_path, const char *archive,
+                                   char *error, size_t error_size)
+{
+    FILE *stream;
+    char line[FORGE_PATH_MAX + 2U];
+    unsigned long count = 0UL;
+    int status;
+
+    stream = fopen(list_path, "r");
+    if (stream == NULL) {
+        forge_util_set_error(error, error_size,
+                  "could not read tar listing for '%s'", archive);
+        return -1;
+    }
+    for (;;) {
+        status = read_listing_line(stream, line, sizeof(line), error, error_size);
+        if (status <= 0) {
+            break;
+        }
+        if (++count > FORGE_TAR_LIST_MAX_LINES) {
+            forge_util_set_error(error, error_size,
+                      "tar archive '%s' lists too many members; refusing to unpack",
+                      archive);
+            (void)fclose(stream);
+            return -1;
+        }
+        if (!tar_member_is_safe(line)) {
+            forge_util_set_error(error, error_size,
+                      "tar archive '%s' has an unsafe member '%s'; refusing to unpack",
+                      archive, line);
+            (void)fclose(stream);
+            return -1;
+        }
+    }
+    if (fclose(stream) != 0 || status < 0) {
+        if (status >= 0) {
+            forge_util_set_error(error, error_size,
+                      "could not read tar listing for '%s'", archive);
+        }
+        return -1;
+    }
+    return 0;
+}
+
+/* The verbose listing starts every line with the entry type: '-' for a
+ * regular file, 'd' for a directory. Symlinks ('l'), hard links ('h'), and
+ * device nodes/fifos/sockets would let a hostile archive write outside the
+ * destination (or plant blocking nodes), so anything else fails closed.
+ * Both GNU tar and bsdtar (Windows/macOS) use these leading letters. */
+static int validate_type_listing(const char *list_path, const char *archive,
+                                 char *error, size_t error_size)
+{
+    FILE *stream;
+    char line[FORGE_PATH_MAX + 2U];
+    int status;
+
+    stream = fopen(list_path, "r");
+    if (stream == NULL) {
+        forge_util_set_error(error, error_size,
+                  "could not read tar listing for '%s'", archive);
+        return -1;
+    }
+    for (;;) {
+        status = read_listing_line(stream, line, sizeof(line), error, error_size);
+        if (status <= 0) {
+            break;
+        }
+        if (line[0] != '-' && line[0] != 'd') {
+            forge_util_set_error(error, error_size,
+                      "tar archive '%s' has a non-regular entry '%.64s'; refusing to unpack",
+                      archive, line);
+            (void)fclose(stream);
+            return -1;
+        }
+    }
+    if (fclose(stream) != 0 || status < 0) {
+        if (status >= 0) {
+            forge_util_set_error(error, error_size,
+                      "could not read tar listing for '%s'", archive);
+        }
+        return -1;
+    }
+    return 0;
+}
+
 int forge_fetch_unpack_tar_gz(ForgeLogger *logger, const char *archive,
                               const char *dest_dir, char *error,
                               size_t error_size)
 {
     ForgeArgv argv = {0};
+    char members_path[FORGE_PATH_MAX];
+    char types_path[FORGE_PATH_MAX];
     int status;
 
     if (archive == NULL || dest_dir == NULL) {
@@ -292,6 +487,30 @@ int forge_fetch_unpack_tar_gz(ForgeLogger *logger, const char *archive,
     if (forge_paths_ensure_directory(dest_dir, error, error_size) != 0) {
         return -1;
     }
+    /* Validate member names and entry types before extracting anything:
+     * a hostile tarball must not yield absolute paths, ".." escapes, or
+     * links/nodes that write outside the destination (tar-slip). */
+    if ((size_t)snprintf(members_path, sizeof(members_path), "%s.forge-members.tmp",
+                         archive) >= sizeof(members_path) ||
+        (size_t)snprintf(types_path, sizeof(types_path), "%s.forge-types.tmp",
+                         archive) >= sizeof(types_path)) {
+        forge_util_set_error(error, error_size, "archive path is too long");
+        return -1;
+    }
+    if (tar_capture_listing(logger, archive, members_path, 0, error, error_size) != 0 ||
+        validate_member_listing(members_path, archive, error, error_size) != 0) {
+        (void)remove(members_path);
+        (void)remove(types_path);
+        return -1;
+    }
+    if (tar_capture_listing(logger, archive, types_path, 1, error, error_size) != 0 ||
+        validate_type_listing(types_path, archive, error, error_size) != 0) {
+        (void)remove(members_path);
+        (void)remove(types_path);
+        return -1;
+    }
+    (void)remove(members_path);
+    (void)remove(types_path);
     if (forge_argv_append(&argv, "tar") != 0 ||
         forge_argv_append(&argv, "-xzf") != 0 ||
         forge_argv_append(&argv, archive) != 0 ||
