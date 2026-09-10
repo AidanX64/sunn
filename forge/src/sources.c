@@ -1,3 +1,15 @@
+#include "forge/platform.h"
+
+/* Feature-test macros before ANY libc header below: lstat() is hidden
+ * under -std=c2x strict conformance without them (glibc's features.h
+ * freezes the feature set at the first libc include, so these cannot sit
+ * after ctype.h/stdio.h). Same pattern as deps.c. MinGW and MSVC expose
+ * lstat unconditionally, hence the guard. */
+#if !FORGE_PLATFORM_WINDOWS
+#define _XOPEN_SOURCE 700
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #ifdef _MSC_VER
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -9,16 +21,7 @@
 #include <string.h>
 
 #include "forge/sources.h"
-#include "forge/platform.h"
 #include "forge_util.h"
-
-/* Feature-test macros before the POSIX headers below: lstat() is hidden
- * under -std=c2x strict conformance without them (glibc) — same pattern
- * as deps.c. MinGW and MSVC expose lstat unconditionally, hence the guard. */
-#if !FORGE_PLATFORM_WINDOWS
-#define _XOPEN_SOURCE 700
-#define _POSIX_C_SOURCE 200809L
-#endif
 
 #if FORGE_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN

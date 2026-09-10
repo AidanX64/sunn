@@ -1,0 +1,4 @@
+# Uniform LF everywhere: generated outputs (public/r) embed source bytes
+# verbatim, so CRLF worktree checkouts produce different build output than
+# LF ones. This keeps Windows and Linux builds byte-identical.
+* text=auto eol=lf
