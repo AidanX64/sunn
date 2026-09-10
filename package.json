@@ -5,11 +5,20 @@
   "engines": {
     "node": ">=20.18.1"
   },
+  "trustedDependencies": [
+    "sharp",
+    "unrs-resolver"
+  ],
+  "overrides": {
+    "@modelcontextprotocol/sdk>zod": "^4",
+    "zod-to-json-schema>zod": "^4",
+    "@modelcontextprotocol/sdk": "1.30.0"
+  },
   "scripts": {
-    "dev": "next dev --turbopack",
-    "build": "next build",
-    "start": "next start",
-    "lint": "next lint",
+    "dev": "bun --bun next dev",
+    "build": "bun --bun next build",
+    "start": "bun --bun next start",
+    "lint": "eslint .",
     "registry:build": "shadcn build",
     "forge:build": "make -C forge CC=gcc",
     "forge:test": "make -C forge test",

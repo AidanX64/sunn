@@ -10,6 +10,11 @@ const compat = new FlatCompat({
 });
 
 const eslintConfig = [
+  {
+    // Build output, generated registries, and vendored C: never lint these.
+    // (Raw `eslint .` — unlike the old `next lint` — does not ignore .next.)
+    ignores: [".next/**", "public/r/**", "public/packages/**", "forge/**"],
+  },
   ...compat.extends("next/core-web-vitals", "next/typescript"),
 ];
 

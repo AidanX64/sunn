@@ -13,17 +13,18 @@ artifacts are still ahead.
 
 ## Quickstart
 
-Prerequisites: Node 20.18+ (22 recommended, see `.nvmrc`), pnpm 10+,
-and a C compiler (`gcc`/`clang`; Windows: mingw-w64).
+Prerequisites: Bun 1.4+ (pinned in `.bun-version`; Node 20.18+
+still works as a fallback, see `.nvmrc`), and a C compiler
+(`gcc`/`clang`; Windows: mingw-w64).
 
 ```sh
-pnpm install
-pnpm dev                    # web UI at http://localhost:3000
+bun install
+bun run dev                 # web UI at http://localhost:3000
 ```
 
 ```sh
-pnpm forge:build            # builds forge/build/forge(.exe)
-pnpm forge:test             # forge --help smoke test
+bun run forge:build          # builds forge/build/forge(.exe)
+bun run forge:test           # forge --help smoke test
 ./forge/build/forge run --release --manifest forge/test/Forge.toml
 ```
 
@@ -69,7 +70,7 @@ sources, never a `main`); per-triplet CI-built binaries are a later
 phase. Rebuild everything from sources with:
 
 ```sh
-pnpm packages:fixtures
+bun run packages:fixtures
 ```
 
 Consume from any forge project once `FORGE_REGISTRY_URL` points here:
@@ -93,7 +94,7 @@ local mirrors and tests with `FORGE_ALLOW_UNSAFE_REGISTRY=1`.
 the source of truth, so edit there and re-sync — never the reverse:
 
 ```sh
-pnpm sync:forge            # re-copy upstream (keeps forge/SOURCE.md)
+bun run sync:forge           # re-copy upstream (keeps forge/SOURCE.md)
 make -C forge clean && make -C forge CC=gcc
 ```
 
@@ -103,8 +104,13 @@ Design, commands, and the test procedure are documented in
 ## Troubleshooting
 
 - `shadcn build` fails with `zod/v3` export errors: your install
-  predates the `pnpm-workspace.yaml` overrides (pnpm ≥ 11 ignores
-  `package.json#pnpm`). Run `pnpm install` fresh.
+  predates the `package.json#overrides` mixed-zod pinning. Run
+  `bun install` fresh.
+- `next dev` 500s on every route with a `globals.css` parse error
+  (`--spacing(4)`): that is `tw-animate-css` (Tailwind v4 syntax) under
+  the v3 pipeline — it fails identically on Node, so it is not a Bun
+  issue. `dev` runs webpack (no `--turbopack` flag) until that import
+  is resolved.
 - `tar failed (exit 2)` from forge on Git-Bash/MSYS2: put native
   System32 `curl`/`tar` first on PATH — the MSYS `tar` cannot run as a
   grandchild of a native process.

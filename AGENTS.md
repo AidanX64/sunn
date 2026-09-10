@@ -40,15 +40,15 @@ scripts/              sync-forge.*, package-registry-fixtures.*
 ## Commands (run from repo root)
 
 ```sh
-pnpm dev                    # web dev server
-pnpm build                  # Next.js production build (runs typecheck)
-pnpm exec tsc --noEmit      # fast typecheck
-pnpm registry:build         # shadcn build -> public/r
-pnpm packages:fixtures      # rebuild fixture tarballs + public/packages metadata
-pnpm forge:build            # make -C forge CC=gcc
-pnpm forge:test             # make -C forge test
-pnpm forge:clean            # make -C forge clean
-pnpm sync:forge             # re-copy upstream forge (preserves forge/SOURCE.md)
+bun run dev                 # web dev server (webpack; see Turbopack gotcha)
+bun run build               # Next.js production build (runs typecheck)
+bunx tsc --noEmit           # fast typecheck
+bun run registry:build      # shadcn build -> public/r
+bun run packages:fixtures   # rebuild fixture tarballs + public/packages metadata
+bun run forge:build         # make -C forge CC=gcc
+bun run forge:test          # make -C forge test
+bun run forge:clean         # make -C forge clean
+bun run sync:forge          # re-copy upstream forge (preserves forge/SOURCE.md)
 ```
 
 Full C verification lives upstream (`make clean && make CC=gcc`,
@@ -58,22 +58,25 @@ fixture runs, `make regression`); see `forge/AGENTS.md`.
 
 - **Web stays at root.** Do not move it to `apps/web`: `@/*` aliases,
   `components.json`, and `shadcn build` paths all assume root.
-- **No Turborepo.** `pnpm scripts + make -C forge` is the orchestration.
+- **No Turborepo.** `bun run` scripts + `make -C forge` is the orchestration.
   Revisit only when a second JS buildable appears.
 - **Two registries, don't mix them.** `registry.json` is shadcn-owned
   (`shadcn build` breaks on unknown item types). Native packages live in
   `public/packages/sunn.registry.json`, validated by
   `lib/sunn-registry.ts`. The forge resolve contract is
   `GET /api/forge/v1/resolve?name=&version=&triplet=`.
-- **pnpm >= 11 reads install settings from `pnpm-workspace.yaml`, NOT
-  `package.json#pnpm`** (silently ignored there). Overrides live in
-  `pnpm-workspace.yaml`. The zod tree is intentionally mixed: v3 at root
+- **Install settings live in `package.json`, NOT `pnpm-workspace.yaml`**
+  (Bun ignores that file, and it is deleted). Overrides plus
+  `trustedDependencies` (`sharp`, `unrs-resolver`) live in
+  `package.json`. The zod tree is intentionally mixed: v3 at root
   (shadcn's schemas call `.deepPartial()`, removed in v4) and v4 under
   `@modelcontextprotocol/sdk` (1.30 imports `zod/v3`, which only exists
   in the v4 package). Do not "unify" it without running
-  `pnpm registry:build`.
-- **Node:** `engines >= 20.18.1`, recommended 22 (`.nvmrc`). The tree was
-  last verified on Node 24; `shadcn build` is the canary.
+  `bun run registry:build`.
+- **Bun-first:** Bun 1.4+ pinned in `.bun-version` (Next CLIs run via
+  `bun --bun`). Node `>= 20.18.1` remains the fallback floor
+  (`.nvmrc`); the tree was last verified on Node 24.
+  `bunx shadcn build` is the canary.
 - **Shader seam:** `lib/custom-shaders.js` is the engine,
   `components/sunn-shader-background.tsx` the wrapper (theme sync,
   WebGPU-missing fallback, cleanup). Openshaders integration, when it
@@ -101,5 +104,9 @@ fixture runs, `make regression`); see `forge/AGENTS.md`.
   PATH: MSYS `tar` cannot run as a grandchild of a native process (its
   gzip helper will not spawn). The regression script handles this; plain
   shells need it too.
-- `pnpm registry:build` output (`public/r/`) is committed; regenerate it
+- `bun run registry:build` output (`public/r/`) is committed; regenerate it
   when `registry/` changes.
+- `bun run dev` is webpack (no `--turbopack`): Turbopack dev hard-fails
+  parsing `tw-animate-css` (Tailwind v4 syntax in `@import`) under the v3
+  pipeline — reproduced identically on Node, so it is a repo issue, not a
+  Bun issue. Re-add the flag only after that import is resolved.

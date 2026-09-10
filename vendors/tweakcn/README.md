@@ -9,5 +9,6 @@ here following the `forge/SOURCE.md` pattern
 (upstream URL + commit SHA + date + license), and record why the
 npm dependency was insufficient.
 
-JS vendors become `pnpm-workspace.yaml` entries only when they
-contain their own `package.json`.
+JS vendors become `workspaces` entries in the root `package.json` only
+when they contain their own `package.json` (Bun workspaces; the old
+`pnpm-workspace.yaml` mechanism is gone since the Bun switch).
