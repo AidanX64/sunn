@@ -4,15 +4,14 @@
 /* sunn package launcher (no dependencies, plain Node >= 20).
  *
  *   sunn serve [--port N]   boot the self-hosted registry (standalone build)
- *   sunn init <dir>         scaffold a working copy from the GitHub release
+ *   sunn init <dir>         scaffold a working copy from this package
  *   sunn help               this text
  *
  * Installed via `npm i -g @v1dxu/sunn` (or `bunx @v1dxu/sunn serve`).
  */
 
-const { execFileSync, spawn } = require("child_process");
+const { spawn } = require("child_process");
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -86,24 +85,6 @@ function serve(args) {
   child.on("exit", (code) => process.exit(code ?? 1));
 }
 
-async function download(url, dest) {
-  const response = await fetch(url, { redirect: "follow" });
-  if (!response.ok) {
-    fail(`download failed (${response.status} ${response.statusText}): ${url}`);
-  }
-  const buffer = Buffer.from(await response.arrayBuffer());
-  fs.writeFileSync(dest, buffer);
-}
-
-function haveTar() {
-  try {
-    execFileSync("tar", ["--version"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function init(args) {
   const dir = args[0];
   if (!dir || args.includes("--help") || args.includes("-h")) {
@@ -113,29 +94,38 @@ async function init(args) {
   if (fs.existsSync(dest) && fs.readdirSync(dest).length !== 0) {
     fail(`refusing to scaffold into non-empty directory: ${dest}`);
   }
-  let version = "main";
-  try {
-    version = `v${require("../package.json").version}`;
-  } catch {
-    /* packed tarball always carries package.json; fall back to main */
-  }
-  const url = `https://github.com/AidanX64/sunn/archive/refs/tags/${version}.tar.gz`;
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sunn-init-"));
-  try {
-    console.log(`sunn: fetching ${url}`);
-    await download(url, path.join(tmp, "sunn.tar.gz"));
-    if (!haveTar()) {
-      fail(
-        "need a `tar` binary to unpack the release — " +
-          `downloaded to ${tmp}, unpack it into ${dest} by hand`
-      );
-    }
-    fs.mkdirSync(dest, { recursive: true });
-    execFileSync("tar", ["-xzf", path.join(tmp, "sunn.tar.gz"), "-C", dest, "--strip-components=1"], {
-      stdio: "inherit",
-    });
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+  const sourceRoot = path.resolve(__dirname, "..");
+  const sourcePaths = [
+    "app",
+    "components",
+    "lib",
+    "registry",
+    "registry-fixtures",
+    "forge",
+    "vendors",
+    "scripts",
+    "public",
+    "bin",
+    "registry.json",
+    "components.json",
+    "next.config.ts",
+    "postcss.config.mjs",
+    "tailwind.config.ts",
+    "tsconfig.json",
+    "eslint.config.mjs",
+    ".bun-version",
+    ".nvmrc",
+    "bun.lock",
+    "package.json",
+    "README.md",
+    "LICENSE",
+  ];
+
+  fs.mkdirSync(dest, { recursive: true });
+  for (const relativePath of sourcePaths) {
+    const source = path.join(sourceRoot, relativePath);
+    const target = path.join(dest, relativePath);
+    fs.cpSync(source, target, { recursive: true });
   }
   console.log(`sunn: scaffolded ${dest}`);
   try {

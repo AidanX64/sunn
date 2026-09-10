@@ -23,13 +23,31 @@
     "bun": ">=1.4.2"
   },
   "bin": {
-    "sunn": "./bin/sunn.js"
+    "sunn": "bin/sunn.js"
   },
   "files": [
     "bin/",
     ".next/standalone/",
     ".next/static/",
+    "app/",
+    "components/",
+    "lib/",
+    "registry/",
+    "registry-fixtures/",
+    "forge/",
+    "vendors/",
+    "scripts/",
     "public/",
+    "registry.json",
+    "components.json",
+    "next.config.ts",
+    "postcss.config.mjs",
+    "tailwind.config.ts",
+    "tsconfig.json",
+    "eslint.config.mjs",
+    ".bun-version",
+    ".nvmrc",
+    "bun.lock",
     "README.md",
     "LICENSE"
   ],
@@ -54,7 +72,8 @@
     "build": "bun --bun next build",
     "start": "bun --bun next start",
     "lint": "eslint .",
-    "prepack": "bun run registry:build && bun run build",
+    "prepack": "bun run registry:build && bun run clean:next && bun run build",
+    "clean:next": "node scripts/clean-next.mjs",
     "registry:build": "shadcn build",
     "forge:build": "make -C forge CC=gcc",
     "forge:test": "make -C forge test",

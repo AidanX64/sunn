@@ -36,11 +36,13 @@ Node 20.18+ or Bun 1.4+ on the host — no compiler, no build step:
 
 ```sh
 npx @v1dxu/sunn serve --port 3100     # self-hosted registry at http://localhost:3100
-npx @v1dxu/sunn init ./my-registry    # scaffold a working copy from the release tag
+npx @v1dxu/sunn init ./my-registry    # scaffold a working copy from the package
 ```
 
-Versions track git tags (`v0.1.0` → `0.1.0` on npm); `init` downloads
-the tag tarball matching its own version.
+The npm package is self-contained: it includes the built server, both
+registries, and the source tree needed to continue development. Versions
+track git tags (`v0.1.0` → `0.1.0` on npm), and `init` copies those files
+directly from the installed package without fetching GitHub.
 
 ```sh
 # a registry dependency, end to end against the local fixtures:
