@@ -1,0 +1,82 @@
+name: ci
+
+# Web (Bun/Next) and vendored forge (C) verification. Deliberately
+# Ubuntu-only: MSVC is untestable on this machine and the MSYS tar
+# grandchild flake is Windows-only (see AGENTS.md gotchas).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: ".bun-version"
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bunx tsc --noEmit
+      - name: Lint
+        run: bun run lint
+      - name: Production build
+        run: bun run build
+      - name: Registry build
+        run: bun run registry:build
+      - name: Committed registry output must be fresh
+        run: git diff --exit-code -- public/r
+      - name: Rebuild native fixtures
+        # package.json uses bare `python` for Windows devs; Ubuntu runners
+        # only guarantee python3. No tarball-drift gate here: tarballs embed
+        # mtimes by design, so rebuilds are byte-different on purpose.
+        run: python3 scripts/package_registry_fixtures.py
+      - name: Smoke-test production server
+        run: |
+          bun --bun next start --port 3100 &
+          server=$!
+          trap 'kill $server' EXIT
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:3100/ > /dev/null && break
+            sleep 2
+          done
+          curl -fsS http://localhost:3100/ > /dev/null
+          curl -fsS http://localhost:3100/packages > /dev/null
+          curl -fsS "http://localhost:3100/api/packages?q=hello-c" > /dev/null
+          curl -fsS "http://localhost:3100/api/forge/v1/resolve?name=hello-c&version=0.1.0&triplet=x64-windows" > /dev/null
+          curl -fsS http://localhost:3100/registry/hello-world > /dev/null
+
+  forge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Git identity for test repos
+        # The regression suites commit throwaway repos; runners have no
+        # identity configured, which would fail them opaquely.
+        run: |
+          git config --global user.email "ci@sunn.local"
+          git config --global user.name "sunn CI"
+          git config --global init.defaultBranch main
+      - name: Clean build (ground truth after header changes)
+        run: make -C forge clean && make -C forge CC=gcc
+      - name: Smoke test
+        run: make -C forge test
+      - name: Fixture run, fresh then incremental
+        run: |
+          ./forge/build/forge run --release --manifest forge/test/Forge.toml | tee /tmp/forge-run1.log
+          grep -q "Hello world!" /tmp/forge-run1.log
+          ./forge/build/forge run --release --manifest forge/test/Forge.toml
+      - name: Regression suites (deps, registry, engine)
+        run: make -C forge regression
