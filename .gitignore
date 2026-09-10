@@ -39,3 +39,15 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# sunn monorepo — vendored forge build outputs (mirror forge/.gitignore)
+# the C sources live in /forge, but outputs are never committed
+/forge/build/
+/forge/target/
+/forge/test/target/
+/forge/*.exe
+/forge/**/*.o
+/forge/**/*.a
+/forge/**/*.lib
+/vendors/*/build/
+/vendors/*/target/

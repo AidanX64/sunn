@@ -2,12 +2,20 @@
   "name": "registry-template",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=20.18.1"
+  },
   "scripts": {
     "dev": "next dev --turbopack",
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "registry:build": "shadcn build"
+    "registry:build": "shadcn build",
+    "forge:build": "make -C forge CC=gcc",
+    "forge:test": "make -C forge test",
+    "forge:clean": "make -C forge clean",
+    "sync:forge": "powershell -ExecutionPolicy Bypass -File scripts/sync-forge.ps1",
+    "packages:fixtures": "python scripts/package_registry_fixtures.py"
   },
   "dependencies": {
     "@radix-ui/react-label": "^2.1.1",
@@ -15,14 +23,17 @@
     "@tanstack/react-query": "^5.64.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "cn": "^0.2.6",
     "lucide-react": "^0.471.1",
     "next": "15.1.9",
     "next-themes": "^0.4.4",
+    "radix-ui": "^1.6.7",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "shadcn": "2.4.0-canary.12",
+    "shadcn": "4.21.0",
     "tailwind-merge": "^2.6.0",
     "tailwindcss-animate": "^1.0.7",
+    "tw-animate-css": "^1.4.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {

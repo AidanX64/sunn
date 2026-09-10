@@ -1,0 +1,53 @@
+{
+  "name": "hello-cpp",
+  "version": "0.1.0",
+  "description": "Minimal c++ library fixture for the sunn native registry (ships objects, never a main).",
+  "license": "MIT",
+  "homepage": "https://example.com/hello-cpp",
+  "lang": "c++",
+  "build": "forge",
+  "triplets": [
+    "arm64-linux",
+    "arm64-macos",
+    "arm64-windows",
+    "x64-linux",
+    "x64-macos",
+    "x64-windows"
+  ],
+  "dependencies": [],
+  "artifacts": [
+    {
+      "triplet": "arm64-linux",
+      "url": "/packages/hello-cpp/hello-cpp-0.1.0.tar.gz",
+      "sha256": "ae722ca39859019db8b09ce04bf6e0d1dd0036057bfa441110ac1a5cf86e3290"
+    },
+    {
+      "triplet": "arm64-macos",
+      "url": "/packages/hello-cpp/hello-cpp-0.1.0.tar.gz",
+      "sha256": "ae722ca39859019db8b09ce04bf6e0d1dd0036057bfa441110ac1a5cf86e3290"
+    },
+    {
+      "triplet": "arm64-windows",
+      "url": "/packages/hello-cpp/hello-cpp-0.1.0.tar.gz",
+      "sha256": "ae722ca39859019db8b09ce04bf6e0d1dd0036057bfa441110ac1a5cf86e3290"
+    },
+    {
+      "triplet": "x64-linux",
+      "url": "/packages/hello-cpp/hello-cpp-0.1.0.tar.gz",
+      "sha256": "ae722ca39859019db8b09ce04bf6e0d1dd0036057bfa441110ac1a5cf86e3290"
+    },
+    {
+      "triplet": "x64-macos",
+      "url": "/packages/hello-cpp/hello-cpp-0.1.0.tar.gz",
+      "sha256": "ae722ca39859019db8b09ce04bf6e0d1dd0036057bfa441110ac1a5cf86e3290"
+    },
+    {
+      "triplet": "x64-windows",
+      "url": "/packages/hello-cpp/hello-cpp-0.1.0.tar.gz",
+      "sha256": "ae722ca39859019db8b09ce04bf6e0d1dd0036057bfa441110ac1a5cf86e3290"
+    }
+  ],
+  "forge": {
+    "manifest": "/packages/hello-cpp/Forge.toml"
+  }
+}

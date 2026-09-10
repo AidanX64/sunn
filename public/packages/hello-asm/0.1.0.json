@@ -1,0 +1,23 @@
+{
+  "name": "hello-asm",
+  "version": "0.1.0",
+  "description": "Minimal asm library fixture for the sunn native registry (ships objects, never a main).",
+  "license": "MIT",
+  "homepage": "https://example.com/hello-asm",
+  "lang": "asm",
+  "build": "forge",
+  "triplets": [
+    "x64-linux"
+  ],
+  "dependencies": [],
+  "artifacts": [
+    {
+      "triplet": "x64-linux",
+      "url": "/packages/hello-asm/hello-asm-0.1.0.tar.gz",
+      "sha256": "30caf929d09dcf704beb8f3416e8b187e6cdd3be26c30fbf127a247667e3039f"
+    }
+  ],
+  "forge": {
+    "manifest": "/packages/hello-asm/Forge.toml"
+  }
+}

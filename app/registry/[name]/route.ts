@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server"
 import path from "path"
 import { promises as fs } from "fs"
-import { registryItemSchema } from "shadcn/registry"
+import { registryItemSchema } from "shadcn/schema"
 
 // Use the registry.json file to generate static paths.
 export const generateStaticParams = async () => {
@@ -48,7 +48,7 @@ export async function GET(
 
     // Read all files in parallel.
     const filesWithContent = await Promise.all(
-      registryItem.files.map(async (file) => {
+      registryItem.files.map(async (file: { path: string }) => {
         const filePath = path.join(process.cwd(), file.path)
         const content = await fs.readFile(filePath, "utf8")
         return { ...file, content }
