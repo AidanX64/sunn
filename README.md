@@ -28,6 +28,20 @@ bun run forge:test           # forge --help smoke test
 ./forge/build/forge run --release --manifest forge/test/Forge.toml
 ```
 
+## Install from npm
+
+Published as [`@v1dxu/sunn`](https://www.npmjs.com/package/@v1dxu/sunn)
+(see [releases](https://github.com/AidanX64/sunn/releases)). Needs
+Node 20.18+ or Bun 1.4+ on the host — no compiler, no build step:
+
+```sh
+npx @v1dxu/sunn serve --port 3100     # self-hosted registry at http://localhost:3100
+npx @v1dxu/sunn init ./my-registry    # scaffold a working copy from the release tag
+```
+
+Versions track git tags (`v0.1.0` → `0.1.0` on npm); `init` downloads
+the tag tarball matching its own version.
+
 ```sh
 # a registry dependency, end to end against the local fixtures:
 export FORGE_REGISTRY_URL="file://$PWD/public"

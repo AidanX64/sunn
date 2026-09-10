@@ -11,9 +11,11 @@ const compat = new FlatCompat({
 
 const eslintConfig = [
   {
-    // Build output, generated registries, and vendored C: never lint these.
-    // (Raw `eslint .` — unlike the old `next lint` — does not ignore .next.)
-    ignores: [".next/**", "public/r/**", "public/packages/**", "forge/**"],
+    // Build output, generated registries, vendored C, and the shipped
+    // launcher never get linted. (Raw `eslint .` — unlike the old
+    // `next lint` — does not ignore .next. bin/ is plain-Node CJS,
+    // validated by `node --check`, outside the TS ruleset.)
+    ignores: [".next/**", "public/r/**", "public/packages/**", "forge/**", "bin/**"],
   },
   ...compat.extends("next/core-web-vitals", "next/typescript"),
 ];

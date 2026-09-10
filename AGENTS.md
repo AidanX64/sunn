@@ -99,6 +99,14 @@ fixture runs, `make regression`); see `forge/AGENTS.md`.
 - **Commits:** conventional style (`feat:`, `fix:`, `docs:`), short
   subjects. Never commit `forge/build/`, `forge/target/`, `.next/`,
   or `node_modules/` (all ignored).
+- **Releases (`@v1dxu/sunn`, one package, manual semver):** bump
+  `version` in `package.json` → commit → tag `vX.Y.Z` → push the tag.
+  The `publish` workflow re-runs every gate (frozen install, tsc,
+  lint, build, registry drift check), refuses mismatched tag/version,
+  then `npm publish --provenance`. First-ever publish is manual
+  (`npm publish --access public` from the `v1dxu` login — the package
+  must exist before npm lets you register it as a trusted publisher);
+  after that OIDC handles it. Never commit npm tokens.
 
 ## Gotchas already learned here (don't rediscover)
 

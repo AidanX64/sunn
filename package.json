@@ -1,24 +1,61 @@
 {
-  "name": "registry-template",
+  "name": "@v1dxu/sunn",
   "version": "0.1.0",
-  "private": true,
+  "description": "sunn: a shadcn component registry next to a native C/C++/ASM package registry, with the forge build tool. Self-hostable via `sunn serve`.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AidanX64/sunn.git"
+  },
+  "homepage": "https://github.com/AidanX64/sunn#readme",
+  "bugs": {
+    "url": "https://github.com/AidanX64/sunn/issues"
+  },
+  "keywords": [
+    "shadcn",
+    "registry",
+    "nextjs",
+    "webgpu",
+    "forge"
+  ],
   "engines": {
-    "node": ">=20.18.1"
+    "node": ">=20.18.1",
+    "bun": ">=1.4.2"
+  },
+  "bin": {
+    "sunn": "./bin/sunn.js"
+  },
+  "files": [
+    "bin/",
+    ".next/standalone/",
+    ".next/static/",
+    "public/",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "trustedDependencies": [
     "sharp",
     "unrs-resolver"
   ],
   "overrides": {
-    "@modelcontextprotocol/sdk>zod": "^4",
-    "zod-to-json-schema>zod": "^4",
-    "@modelcontextprotocol/sdk": "1.30.0"
+    "@modelcontextprotocol/sdk": {
+      ".": "1.30.0",
+      "zod": "^4"
+    },
+    "zod-to-json-schema": {
+      "zod": "^4"
+    }
   },
   "scripts": {
     "dev": "bun --bun next dev",
     "build": "bun --bun next build",
     "start": "bun --bun next start",
     "lint": "eslint .",
+    "prepack": "bun run registry:build && bun run build",
     "registry:build": "shadcn build",
     "forge:build": "make -C forge CC=gcc",
     "forge:test": "make -C forge test",

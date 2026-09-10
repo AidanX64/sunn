@@ -1,0 +1,45 @@
+name: publish
+
+# First-ever publish is manual (`npm publish --access public` from a
+# logged-in shell — the package must exist before npm lets you register
+# it as a trusted publisher). Every publish after that flows through
+# here on version tags, with no long-lived tokens (OIDC + provenance).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # Same reasoning as ci.yml: .bun-version tracks a
+          # canary-labelled local toolchain with no published linux asset.
+          bun-version: "1.4.2"
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bunx tsc --noEmit
+      - name: Lint
+        run: bun run lint
+      - name: Production build
+        run: bun run build
+      - name: Registry build
+        run: bun run registry:build
+      - name: Committed registry output must be fresh
+        run: git diff --exit-code -- public/r
+      - name: Tag must match package.json version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(bun -e 'console.log(require("./package.json").version)')"
+          test "$tag" = "$pkg" || { echo "tag $GITHUB_REF_NAME != package.json $pkg"; exit 1; }
+      - name: Publish to npm with provenance
+        run: npm publish --provenance --access public
