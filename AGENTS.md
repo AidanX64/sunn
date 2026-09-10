@@ -106,7 +106,12 @@ fixture runs, `make regression`); see `forge/AGENTS.md`.
   then `npm publish --provenance`. First-ever publish is manual
   (`npm publish --access public` from the `v1dxu` login — the package
   must exist before npm lets you register it as a trusted publisher);
-  after that OIDC handles it. Never commit npm tokens.
+  after that OIDC handles it. Never commit npm tokens. Keep
+  `publishConfig` to `access` only: npm hard-fails local publishes on
+  a configured-but-unsatisfiable `provenance` (EUSAGE), and JSON
+  forbids `//` comments anywhere in `package.json` (strict parsers —
+  Browserslist, webpack, npm itself — reject them even though Bun and
+  tsc tolerate them, which hides the breakage locally).
 
 ## Gotchas already learned here (don't rediscover)
 
