@@ -60,6 +60,11 @@ fixture runs, `make regression`); see `forge/AGENTS.md`.
   `components.json`, and `shadcn build` paths all assume root.
 - **No Turborepo.** `bun run` scripts + `make -C forge` is the orchestration.
   Revisit only when a second JS buildable appears.
+- **Never run pnpm/npm in this repo.** pnpm v12 auto-recreates
+  `pnpm-lock.yaml` + `pnpm-workspace.yaml` on any invocation
+  (`verify-deps-before-run`), dirtying the tree behind your back. Use
+  `bun run …` for JS and `make -C forge …` directly for C (the
+  `forge:*` scripts are plain make passthroughs).
 - **Two registries, don't mix them.** `registry.json` is shadcn-owned
   (`shadcn build` breaks on unknown item types). Native packages live in
   `public/packages/sunn.registry.json`, validated by
