@@ -34,8 +34,10 @@
     "LICENSE"
   ],
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    // NOTE: no "provenance" here on purpose — npm hard-fails a local
+    // `npm publish` when provenance is configured but no CI OIDC provider
+    // exists (EUSAGE). CI passes --provenance explicitly (see publish.yml).
+    "access": "public"
   },
   "trustedDependencies": [
     "sharp",
