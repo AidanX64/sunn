@@ -12,6 +12,14 @@
 #include "forge/platform.h"
 #include "forge_util.h"
 
+/* Feature-test macros before the POSIX headers below: lstat() is hidden
+ * under -std=c2x strict conformance without them (glibc) — same pattern
+ * as deps.c. MinGW and MSVC expose lstat unconditionally, hence the guard. */
+#if !FORGE_PLATFORM_WINDOWS
+#define _XOPEN_SOURCE 700
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #if FORGE_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

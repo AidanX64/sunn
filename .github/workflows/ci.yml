@@ -24,7 +24,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version-file: ".bun-version"
+          # Pinned explicitly, not via .bun-version: that file tracks the
+          # local dev toolchain (1.4.3, canary-labelled) which has no
+          # published linux-x64 release asset (setup-bun 404s on it).
+          # 1.4.2 is the newest stable with full release assets.
+          bun-version: "1.4.2"
       - name: Install (frozen lockfile)
         run: bun install --frozen-lockfile
       - name: Typecheck
