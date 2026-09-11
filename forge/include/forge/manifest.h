@@ -24,6 +24,10 @@ typedef struct ForgeDependency {
      * ("" tracks the newest allowed state, like an unpinned git ref). */
     char registry[FORGE_MANIFEST_VALUE_MAX];
     char registry_version[FORGE_MANIFEST_VALUE_MAX];
+    /* Registry deps only: minimum acceptable version ("", or >= this).
+     * Mutually exclusive with registry_version: an exact pin never moves,
+     * a minimum floats within [minimum, newest] like a vcpkg version>=. */
+    char registry_min_version[FORGE_MANIFEST_VALUE_MAX];
     /* Git deps only: clone/update git submodules alongside the checkout. */
     int submodules;
 } ForgeDependency;
@@ -60,5 +64,13 @@ typedef struct ForgeManifest {
 /* Loads the supported Forge.toml subset. Returns 0 on success. */
 int forge_manifest_load(const char *path, ForgeManifest *manifest,
                         char *error, size_t error_size);
+
+/*
+ * Total semver precedence for validated versions: numeric MAJOR/MINOR/PATCH,
+ * releases outranking pre-releases, pre-release identifiers per semver 11.4;
+ * "+build" suffixes are ignored. Returns -1 when a < b, 0 when equal,
+ * 1 when a > b.
+ */
+int forge_version_compare(const char *a, const char *b);
 
 #endif

@@ -13,8 +13,14 @@
 
 /* A registry recipe describes upstream source; it is not an artifact host. */
 
+/* Recipe revisions share the registry schema's bound (lib/sunn-registry.ts). */
+#define FORGE_REGISTRY_MAX_REVISION 1000000U
+
 typedef struct ForgeRegistryPin {
     char version[FORGE_MANIFEST_VALUE_MAX];
+    /* Recipe revision: a recipe fix without a new upstream release.
+     * Absent in older recipes and lockfiles, where it means 0. */
+    unsigned revision;
     char kind[8];
     char location[FORGE_PATH_MAX];
     char ref[FORGE_MANIFEST_VALUE_MAX];
@@ -45,9 +51,12 @@ int forge_registry_query(ForgeLogger *logger, const char *package,
 /*
  * Ensures `package_dir/<version>` holds the verified, unpacked dependency.
  * `dep_name` is the local [dependencies] name (used in user-facing errors);
- * `package` the registry package. `wanted_version` "" keeps the lock pin
- * (offline-friendly) unless `force_update` asks for the newest allowed
- * state. Sets `*reused` to 1
+ * `package` the registry package. `wanted_version` names an exact pin (""
+ * when the entry floats); `min_version` names a manifest minimum ("" when
+ * the entry is exact or bare). `lock_*` carry the Forge.lock pin
+ * (`lock_revision` 0 when the lock predates revisions). Exact pins bypass
+ * the registry baseline; minimums and bare entries resolve no lower, and
+ * `force_update` tracks newest (minimum-checked). Sets `*reused` to 1
  * when a matching checkout was already on disk (no network touched), 0
  * after a fetch. `root_out` receives the unpacked directory, `pin` the pin
  * to record. --offline only ever reuses; anything needing network fails
@@ -56,10 +65,12 @@ int forge_registry_query(ForgeLogger *logger, const char *package,
 int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
                                const char *package,
                                const char *wanted_version,
+                               const char *min_version,
                                const char *lock_version, const char *lock_kind,
                                const char *lock_location,
                                const char *lock_ref, const char *lock_commit,
                                const char *lock_sha256,
+                               unsigned lock_revision,
                                int force_update, int offline,
                                const char *package_dir,
                                char *root_out, size_t root_size,

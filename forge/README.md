@@ -257,8 +257,21 @@ registry**, like CPM, Meson wrapdb, and vcpkg all do in their own way:
 [dependencies]
 hello_lib = { path = "../libhello" }
 coolib    = { git = "https://github.com/example/coolib", tag = "v1.2" }   # branch/rev also work
-serde_c   = { registry = "serde-c", version = "0.1.0" }                   # omit version to track newest
+serde_c   = { registry = "serde-c", version = "0.1.0" }                   # exact pin, never moves
+serde_d   = { registry = "serde-d", min-version = "0.2.0" }                # minimum, floats within [min, newest]
+serde_e   = { registry = "serde-e" }                                      # bare: tracks the registry baseline
 ```
+
+- Registry deps are versioned recipes, vcpkg-style: the registry's
+  `baseline.json` pins the minimum (version, revision) per package.
+  Exact `version` pins bypass the baseline and never move (only the
+  manifest moves them); `min-version` and bare entries resolve no lower
+  than the floor, and `forge update` moves them to newest. The resolved
+  recipe revision rides along in `Forge.lock`, so a recipe fix without a
+  new upstream release updates cleanly instead of tripping the
+  tamper gate — while same-version bytes that change under a pin are
+  still refused loudly. A lockfile from before revisions (no `revision`
+  key) keeps resolving byte-identically.
 
 - Git deps are cloned into a shared cache (`~/.forge/git`, override with
   `FORGE_HOME`) and pinned by resolved commit SHA in a generated `Forge.lock`
@@ -298,7 +311,9 @@ Dependencies can be managed without hand-editing the manifest, Cargo-style:
 ```sh
 forge add mylib --git https://github.com/example/mylib --tag v1.2
 forge add utils --path ../utils      # path deps are used in place, never cached
-forge add hello --registry hello-c --version 0.1.0   # omit --version to pin newest
+forge add hello --registry hello-c --version 0.1.0   # exact pin
+forge add hello --registry hello-c --min-version 0.1.0   # minimum
+forge add hello --registry hello-c   # bare: tracks the baseline
 forge update mylib                   # pull just this dep to its newest allowed state
 forge remove mylib                   # drop the entry and prune its lock pin
 ```

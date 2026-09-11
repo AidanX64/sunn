@@ -24,7 +24,7 @@ static void print_usage(FILE *stream)
             "                        re-resolve deps (one, or all when NAME is omitted)\n"
             "  forge add <NAME> --git URL [--tag T | --branch B | --rev R]\n"
             "  forge add <NAME> --path DIR      [--manifest PATH]\n"
-            "  forge add <NAME> --registry PKG [--version VER]\n"
+            "  forge add <NAME> --registry PKG [--version VER | --min-version VER]\n"
             "      git URLs accept https://, ssh://, and git@host:path;\n"
             "      FORGE_ALLOW_UNSAFE_GIT=1 lifts that restriction\n"
             "      registry packages come from FORGE_REGISTRY_URL recipes and\n"
@@ -79,10 +79,10 @@ static const ForgeVerbHelp VERB_HELP[] = {
       "state; naming one moves only that dep past its pin. --offline forbids "
       "network access." },
     { "add", "forge add <NAME> (--git URL | --path DIR | --registry PKG) "
-             "[--tag T | --branch B | --rev R] [--version VER] [--manifest PATH]",
+             "[--tag T | --branch B | --rev R] [--version VER | --min-version VER] [--manifest PATH]",
       "Insert a dependency into [dependencies]; git URLs must use https://, "
-      "ssh://, or git@host:path; --version pins a registry package (latest "
-      "when omitted)." },
+      "ssh://, or git@host:path; --version pins a registry package exactly, "
+      "--min-version sets a minimum, and a bare entry tracks the baseline." },
     { "remove", "forge remove <NAME> [--manifest PATH]",
       "Remove a dependency from [dependencies] and its lock entry." },
     { "new", "forge new <NAME>",
@@ -310,8 +310,9 @@ static int command_build_like(const char *command, int argc, char **argv)
 }
 
 /* forge add NAME (--git URL | --path DIR | --registry PKG)
- * [--tag T|--branch B|--rev R] [--version VER] [--manifest PATH].
- * Exactly one source; refs are git-only, versions registry-only. */
+ * [--tag T|--branch B|--rev R] [--version VER | --min-version VER]
+ * [--manifest PATH]. Exactly one source; refs are git-only, versions
+ * registry-only; --version and --min-version exclude each other. */
 static int command_add(int argc, char **argv)
 {
     const char *manifest_path = "Forge.toml";
@@ -320,6 +321,7 @@ static int command_add(int argc, char **argv)
     const char *dep_path = NULL;
     const char *registry_package = NULL;
     const char *registry_version = "";
+    const char *registry_min_version = "";
     const char *ref_kind = "";
     const char *ref_value = "";
     char discovered[FORGE_PATH_MAX];
@@ -354,6 +356,11 @@ static int command_add(int argc, char **argv)
                 return 1;
             }
             registry_version = argv[++index];
+        } else if (strcmp(argv[index], "--min-version") == 0) {
+            if (flag_value_missing("--min-version", index, argc)) {
+                return 1;
+            }
+            registry_min_version = argv[++index];
         } else if (strcmp(argv[index], "--tag") == 0 ||
                    strcmp(argv[index], "--branch") == 0 ||
                    strcmp(argv[index], "--rev") == 0) {
@@ -380,10 +387,15 @@ static int command_add(int argc, char **argv)
         }
     }
     discover_manifest(&manifest_path, explicit_manifest, discovered, sizeof(discovered));
+    if (registry_version[0] != '\0' && registry_min_version[0] != '\0') {
+        fprintf(stderr, "forge: 'add' accepts only one of "
+                        "--version/--min-version\n");
+        return 1;
+    }
     return forge_orchestrate_add(manifest_path, name, git_url != NULL ? git_url : "",
                                  ref_kind, ref_value, dep_path != NULL ? dep_path : "",
                                  registry_package != NULL ? registry_package : "",
-                                 registry_version);
+                                 registry_version, registry_min_version);
 }
 
 static int command_remove(int argc, char **argv)

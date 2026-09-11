@@ -35,6 +35,8 @@ const sha256Schema = z
   .string()
   .regex(/^[0-9a-f]{64}$/i, "sha256 must be 64 hex chars")
 
+const revisionSchema = z.number().int().min(0).max(1000000).default(0)
+
 const homepageSchema = z
   .string()
   .max(2048)
@@ -80,6 +82,7 @@ export const nativePackageSchema = z
   .object({
     name: packageNameSchema,
     version: packageVersionSchema,
+    revision: revisionSchema,
     description: z.string().max(1024).default(""),
     license: z.string().max(64).default(""),
     homepage: homepageSchema.default(""),
@@ -98,10 +101,22 @@ const indexEntrySchema = z
   .object({
     name: packageNameSchema,
     latest: packageVersionSchema,
+    latest_revision: revisionSchema,
     description: z.string().max(1024).default(""),
     license: z.string().max(64).default(""),
     homepage: homepageSchema.default(""),
     index: indexPathSchema,
+    versions: z
+      .array(
+        z
+          .object({
+            version: packageVersionSchema,
+            revision: revisionSchema,
+          })
+          .strict()
+      )
+      .max(1000)
+      .default([]),
   })
   .strict()
 
@@ -115,6 +130,26 @@ export const registryIndexSchema = z
   .strict()
 
 export type RegistryIndex = z.infer<typeof registryIndexSchema>
+
+const baselineEntrySchema = z
+  .object({
+    name: packageNameSchema,
+    version: packageVersionSchema,
+    revision: revisionSchema,
+  })
+  .strict()
+
+// Registry-wide minimum floor: consumers without an exact pin resolve to
+// at least these versions (vcpkg baseline semantics). Served statically at
+// /baseline.json; the forge client validates it with this schema.
+export const registryBaselineSchema = z
+  .object({
+    name: z.string().min(1).max(64),
+    baseline: z.array(baselineEntrySchema).max(1000),
+  })
+  .strict()
+
+export type RegistryBaseline = z.infer<typeof registryBaselineSchema>
 
 /**
  * Resolve a registry `index` pointer (e.g. `/packages/hello-c/0.1.0.json`)

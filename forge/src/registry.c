@@ -14,7 +14,13 @@
 #include "forge_util.h"
 
 static int read_response_file(const char *path, char *body, size_t body_size,
-                              char *error, size_t error_size);
+                               char *error, size_t error_size);
+static int resolve_floor(ForgeLogger *logger, const char *dep_name,
+                         const char *base, const char *package,
+                         const char *min_version, const char *tmp_path,
+                         int offline, char *floor_version, size_t floor_size,
+                         unsigned *floor_revision,
+                         char *error, size_t error_size);
 
 /* ------------------------------------------------------------------ */
 /* Base URL + host triplet                                             */
@@ -46,11 +52,11 @@ int forge_registry_base_url(char *base_out, size_t base_size,
     return 0;
 }
 static void registry_identity(const ForgeRegistryPin *pin, char *out,
-                              size_t out_size)
+                               size_t out_size)
 {
-    size_t used = (size_t)snprintf(out, out_size, "%s|%s|%s|%s|%s|",
+    size_t used = (size_t)snprintf(out, out_size, "%s|%s|%s|%s|%s|%u|",
                                    pin->kind, pin->location, pin->ref,
-                                   pin->commit, pin->sha256);
+                                   pin->commit, pin->sha256, pin->revision);
     for (size_t index = 0U; index < pin->patch_count && used < out_size; ++index) {
         int written = snprintf(out + used, out_size - used, "%s|",
                                 pin->patches[index]);
@@ -192,9 +198,11 @@ static int apply_registry_patches(ForgeLogger *logger, const char *base,
 int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
                                const char *package,
                                const char *wanted_version,
+                               const char *min_version,
                                const char *lock_version, const char *lock_kind,
                                const char *lock_location, const char *lock_ref,
                                const char *lock_commit, const char *lock_sha256,
+                               unsigned lock_revision,
                                int force_update, int offline,
                                const char *package_dir,
                                char *root_out, size_t root_size,
@@ -203,12 +211,15 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
 {
     char base[FORGE_PATH_MAX];
     char version[FORGE_MANIFEST_VALUE_MAX];
+    char floor_version[FORGE_MANIFEST_VALUE_MAX];
+    unsigned floor_revision = 0U;
     char safe[FORGE_PATH_MAX];
     char version_dir[FORGE_PATH_MAX];
     char resolve_tmp[FORGE_PATH_MAX];
     char marker[FORGE_PATH_MAX * 2U];
     char identity[FORGE_PATH_MAX * 2U];
     int query_latest;
+    int min_given = min_version != NULL && min_version[0] != '\0';
 
     if (pin == NULL || reused == NULL) {
         forge_util_set_error(error, error_size, "registry materialize needs a pin");
@@ -222,13 +233,47 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
                              package != NULL ? package : "<null>");
         return -1;
     }
-    query_latest = wanted_version == NULL || wanted_version[0] == '\0';
-    if (!query_latest) {
+    query_latest = 0;
+    floor_version[0] = '\0';
+    if (wanted_version != NULL && wanted_version[0] != '\0') {
+        /* Exact pins name their bytes outright and bypass the baseline. */
         (void)snprintf(version, sizeof(version), "%s", wanted_version);
-    } else if (lock_version != NULL && lock_version[0] != '\0' && !force_update) {
+    } else if (force_update && !min_given) {
+        /*
+         * Bare update: track newest. The baseline floors fresh
+         * resolutions; it never holds back an explicit update.
+         */
+        version[0] = '\0';
+        query_latest = 1;
+    } else if (!force_update && lock_version != NULL && lock_version[0] != '\0' &&
+               (!min_given ||
+                forge_version_compare(lock_version, min_version) >= 0)) {
+        /*
+         * A lock pin that already satisfies the minimum stays put without
+         * touching the network: the baseline governs fresh and update
+         * resolutions, it never ambushes a locked build.
+         */
         (void)snprintf(version, sizeof(version), "%s", lock_version);
     } else {
-        version[0] = '\0';
+        /*
+         * Fresh bare/minimum resolution, a lock below the new minimum, or
+         * an update carrying a minimum: the floor decides. With no floor
+         * at all a bare entry tracks newest; updates always track newest
+         * and check the floor after the query.
+         */
+        if (resolve_floor(logger, dep_name, base, package,
+                          min_given ? min_version : "",
+                          resolve_tmp, offline, floor_version,
+                          sizeof(floor_version), &floor_revision,
+                          error, error_size) != 0) {
+            return -1;
+        }
+        if (force_update || floor_version[0] == '\0') {
+            version[0] = '\0';
+            query_latest = 1;
+        } else {
+            (void)snprintf(version, sizeof(version), "%s", floor_version);
+        }
     }
     if (version[0] != '\0') {
         forge_paths_safe_output_name(version, safe, sizeof(safe));
@@ -278,6 +323,7 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
         (void)snprintf(locked.ref, sizeof(locked.ref), "%s", lock_ref);
         (void)snprintf(locked.commit, sizeof(locked.commit), "%s", lock_commit);
         (void)snprintf(locked.sha256, sizeof(locked.sha256), "%s", lock_sha256);
+        locked.revision = lock_revision;
         registry_identity(&locked, identity, sizeof(identity));
         recipe_read_marker(version_dir, marker, sizeof(marker));
         if (!force_update && strcmp(identity, marker) == 0 &&
@@ -288,6 +334,7 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
             (void)snprintf(pin->ref, sizeof(pin->ref), "%s", locked.ref);
             (void)snprintf(pin->commit, sizeof(pin->commit), "%s", locked.commit);
             (void)snprintf(pin->sha256, sizeof(pin->sha256), "%s", locked.sha256);
+            pin->revision = locked.revision;
             (void)snprintf(root_out, root_size, "%s", version_dir);
             *reused = 1;
             return 0;
@@ -301,7 +348,18 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
     }
     if (forge_registry_query(logger, package, version, resolve_tmp, pin,
                              error, error_size) != 0) return -1;
-    if (lock_version != NULL && lock_version[0] != '\0' &&
+    if (query_latest && floor_version[0] != '\0' &&
+        (forge_version_compare(pin->version, floor_version) < 0 ||
+         (forge_version_compare(pin->version, floor_version) == 0 &&
+          pin->revision < floor_revision))) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s': newest registry release %s is below the "
+                  "required minimum %s",
+                  dep_name != NULL ? dep_name : package, pin->version,
+                  floor_version);
+        return -1;
+    }
+    if (!force_update && lock_version != NULL && lock_version[0] != '\0' &&
         strcmp(pin->version, lock_version) == 0 &&
         ((lock_kind != NULL && strcmp(pin->kind, lock_kind) != 0) ||
          (lock_location != NULL && strcmp(pin->location, lock_location) != 0) ||
@@ -700,6 +758,80 @@ static int json_object_string(ForgeJsonCursor *cursor, const char *wanted,
 }
 
 /*
+ * Same walk as json_object_string but for a non-negative integer value
+ * (recipe and baseline revisions). Rejects signs, fractions, exponents,
+ * and values above `max`; null counts as found-with-null. Returns
+ * 1 when the key was found, 0 when absent, -1 on malformed input.
+ */
+static int json_object_uint(ForgeJsonCursor *cursor, const char *wanted,
+                            unsigned *out, unsigned max, int *is_null)
+{
+    int first = 1;
+
+    *is_null = 0;
+    json_skip_space(cursor);
+    if (*cursor->text != '{') {
+        cursor->error = "expected an object";
+        return -1;
+    }
+    ++cursor->text;
+    for (;;) {
+        char key[128];
+
+        json_skip_space(cursor);
+        if (*cursor->text == '}') {
+            ++cursor->text;
+            return 0;
+        }
+        if (!first) {
+            if (*cursor->text != ',') {
+                cursor->error = "expected ',' or '}'";
+                return -1;
+            }
+            ++cursor->text;
+            json_skip_space(cursor);
+        }
+        first = 0;
+        if (json_read_string(cursor, key, sizeof(key)) != 0) {
+            return -1;
+        }
+        json_skip_space(cursor);
+        if (*cursor->text != ':') {
+            cursor->error = "expected ':'";
+            return -1;
+        }
+        ++cursor->text;
+        json_skip_space(cursor);
+        if (strcmp(key, wanted) == 0) {
+            unsigned long value = 0UL;
+
+            if (strncmp(cursor->text, "null", 4U) == 0) {
+                *is_null = 1;
+                cursor->text += 4U;
+                return 1;
+            }
+            if (!isdigit((unsigned char)*cursor->text)) {
+                cursor->error = "expected an integer";
+                return -1;
+            }
+            while (isdigit((unsigned char)*cursor->text)) {
+                value = value * 10UL + (unsigned long)(*cursor->text - '0');
+                if (value > max) {
+                    cursor->error = "integer is too large";
+                    return -1;
+                }
+                ++cursor->text;
+            }
+            *out = (unsigned)value;
+            return 1;
+        }
+        if (json_skip_value(cursor) != 0) {
+            return -1;
+        }
+    }
+}
+
+/*
  * Reads `outer.inner` (one nesting level, e.g. artifact.url). Follows the
  * same found/absent/malformed contract; null counts as found-with-null.
  */static int json_nested_string(const char *json, const char *outer,
@@ -833,6 +965,16 @@ static int parse_recipe(const char *body, const char *base,
                                pin->version, sizeof(pin->version), &is_null);
     if (found <= 0 || is_null || !version_text_is_valid(pin->version)) {
         forge_util_set_error(error, error_size, "registry response has no usable version");
+        return -1;
+    }
+    /* Recipe revisions share the registry schema's bound; older recipes
+     * without the field mean revision 0. */
+    pin->revision = 0U;
+    found = json_object_uint(&(ForgeJsonCursor){ body, NULL }, "revision",
+                             &pin->revision, FORGE_REGISTRY_MAX_REVISION,
+                             &is_null);
+    if (found < 0) {
+        forge_util_set_error(error, error_size, "registry response has no usable revision");
         return -1;
     }
     found = json_nested_string(body, "source", "kind", pin->kind,
@@ -1170,6 +1312,265 @@ static int read_response_file(const char *path, char *body, size_t body_size,
         return -1;
     }
     body[total] = '\0';
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Registry baseline (minimum floor for floating entries)              */
+/*                                                                     */
+/* baseline.json at the registry root pins the minimum (version,       */
+/* revision) per package, vcpkg-baseline style. Exact manifest pins    */
+/* bypass it; minimums and bare entries resolve no lower. A registry   */
+/* without the file (or without an entry) simply has no floor.         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Looks up `package` in a baseline.json body. Returns 1 with the floor in
+ * `version_out`/`revision_out`, 0 when the package has no entry, -1 on
+ * malformed input. A missing revision means 0.
+ */
+static int baseline_lookup(const char *body, const char *package,
+                           char *version_out, size_t version_size,
+                           unsigned *revision_out)
+{
+    ForgeJsonCursor cursor = { body, NULL };
+    int first = 1;
+
+    json_skip_space(&cursor);
+    if (*cursor.text != '{') {
+        return -1;
+    }
+    ++cursor.text;
+    /* Locate the "baseline" array. */
+    for (;;) {
+        char key[128];
+
+        json_skip_space(&cursor);
+        if (*cursor.text == '}') {
+            return 0;
+        }
+        if (!first) {
+            if (*cursor.text != ',') {
+                return -1;
+            }
+            ++cursor.text;
+            json_skip_space(&cursor);
+        }
+        first = 0;
+        if (json_read_string(&cursor, key, sizeof(key)) != 0) {
+            return -1;
+        }
+        json_skip_space(&cursor);
+        if (*cursor.text != ':') {
+            return -1;
+        }
+        ++cursor.text;
+        json_skip_space(&cursor);
+        if (strcmp(key, "baseline") == 0) {
+            break;
+        }
+        if (json_skip_value(&cursor) != 0) {
+            return -1;
+        }
+    }
+    if (*cursor.text != '[') {
+        return -1;
+    }
+    ++cursor.text;
+    for (;;) {
+        const char *span_start;
+        char span[2048];
+        size_t span_length;
+        ForgeJsonCursor object;
+        char candidate[FORGE_PATH_MAX];
+        char entry_version[FORGE_MANIFEST_VALUE_MAX];
+        unsigned entry_revision = 0U;
+        int is_null = 0;
+        int matched;
+
+        json_skip_space(&cursor);
+        if (*cursor.text == ']') {
+            return 0;
+        }
+        if (*cursor.text != '{') {
+            return -1;
+        }
+        span_start = cursor.text;
+        if (json_skip_value(&cursor) != 0) {
+            return -1;
+        }
+        span_length = (size_t)(cursor.text - span_start);
+        if (span_length >= sizeof(span)) {
+            return -1;
+        }
+        memcpy(span, span_start, span_length);
+        span[span_length] = '\0';
+        object.text = span;
+        object.error = NULL;
+        matched = json_object_string(&object, "name", candidate,
+                                     sizeof(candidate), &is_null);
+        if (matched < 0) {
+            return -1;
+        }
+        if (matched == 0 || is_null || strcmp(candidate, package) != 0) {
+            json_skip_space(&cursor);
+            if (*cursor.text == ',') {
+                ++cursor.text;
+            }
+            continue;
+        }
+        object.text = span;
+        object.error = NULL;
+        matched = json_object_string(&object, "version", entry_version,
+                                     sizeof(entry_version), &is_null);
+        if (matched <= 0 || is_null || !version_text_is_valid(entry_version)) {
+            return -1;
+        }
+        object.text = span;
+        object.error = NULL;
+        matched = json_object_uint(&object, "revision", &entry_revision,
+                                   FORGE_REGISTRY_MAX_REVISION, &is_null);
+        if (matched < 0) {
+            return -1;
+        }
+        if ((size_t)snprintf(version_out, version_size, "%s",
+                             entry_version) >= version_size) {
+            return -1;
+        }
+        *revision_out = (matched > 0 && !is_null) ? entry_revision : 0U;
+        return 1;
+    }
+}
+
+/*
+ * Reads the baseline floor for `package`: an empty `version_out` (with
+ * revision 0) means the registry states no floor. A missing baseline.json
+ * on a file:// registry predates baselines and is not an error; over HTTP
+ * every failure is loud so a misconfigured registry cannot silently float
+ * pins to newest. --offline always fails: a floor the lockfile cannot
+ * vouch for must never resolve.
+ */
+static int fetch_baseline(ForgeLogger *logger, const char *base,
+                          const char *package, const char *tmp_path,
+                          int offline, const char *dep_name,
+                          char *version_out, size_t version_size,
+                          unsigned *revision_out,
+                          char *error, size_t error_size)
+{
+    char path[FORGE_PATH_MAX * 2U];
+    char body[65536];
+    int looked_up;
+
+    version_out[0] = '\0';
+    *revision_out = 0U;
+    if (offline) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s': registry baseline is not cached and "
+                  "--offline forbids fetching it",
+                  dep_name != NULL ? dep_name : package);
+        return -1;
+    }
+    if (strncmp(base, "file://", 7U) == 0) {
+        char root[FORGE_PATH_MAX];
+        const char *dir = base + 7U;
+        FILE *probe;
+
+        if (dir[0] != '/') {
+            forge_util_set_error(error, error_size,
+                      "file:// registries must point at a local directory "
+                      "(file:///path); host shares are not supported");
+            return -1;
+        }
+        if (snprintf(root, sizeof(root), "%s", dir) < 0 ||
+            strlen(dir) >= sizeof(root)) {
+            forge_util_set_error(error, error_size, "registry path is too long");
+            return -1;
+        }
+        if (root[0] == '/' && isalpha((unsigned char)root[1]) && root[2] == ':') {
+            memmove(root, root + 1U, strlen(root));
+        }
+        if (snprintf(path, sizeof(path), "%s/baseline.json", root) < 0 ||
+            strlen(root) + 14U >= sizeof(path)) {
+            forge_util_set_error(error, error_size, "registry path is too long");
+            return -1;
+        }
+        probe = fopen(path, "rb");
+        if (probe == NULL) {
+            return 0;
+        }
+        (void)fclose(probe);
+        if (read_response_file(path, body, sizeof(body), error,
+                               error_size) != 0) {
+            return -1;
+        }
+    } else {
+        if (snprintf(path, sizeof(path), "%s/baseline.json", base) < 0 ||
+            strlen(base) + 14U >= sizeof(path)) {
+            forge_util_set_error(error, error_size, "registry query URL is too long");
+            return -1;
+        }
+        if (forge_fetch_url_is_supported(path, error, error_size) != 0 ||
+            forge_fetch_to_file(logger, path, tmp_path, error, error_size) != 0 ||
+            read_response_file(tmp_path, body, sizeof(body), error,
+                               error_size) != 0) {
+            return -1;
+        }
+    }
+    if (body[0] != '{') {
+        forge_util_set_error(error, error_size,
+                  "registry baseline '%s' is not valid JSON", path);
+        return -1;
+    }
+    looked_up = baseline_lookup(body, package, version_out, version_size,
+                                revision_out);
+    if (looked_up < 0) {
+        forge_util_set_error(error, error_size,
+                  "registry baseline '%s' is not valid JSON", path);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Computes the (version, revision) floor for a floating entry: the manifest
+ * minimum raised to the registry baseline. An empty floor version means
+ * "no floor", and bare entries then track newest. Fails closed.
+ */
+static int resolve_floor(ForgeLogger *logger, const char *dep_name,
+                         const char *base, const char *package,
+                         const char *min_version, const char *tmp_path,
+                         int offline, char *floor_version, size_t floor_size,
+                         unsigned *floor_revision,
+                         char *error, size_t error_size)
+{
+    char baseline_version[FORGE_MANIFEST_VALUE_MAX] = { 0 };
+    unsigned baseline_revision = 0U;
+    int order;
+
+    floor_version[0] = '\0';
+    *floor_revision = 0U;
+    if (min_version != NULL && min_version[0] != '\0') {
+        (void)snprintf(floor_version, floor_size, "%s", min_version);
+    }
+    if (fetch_baseline(logger, base, package, tmp_path, offline, dep_name,
+                       baseline_version, sizeof(baseline_version),
+                       &baseline_revision, error, error_size) != 0) {
+        return -1;
+    }
+    if (baseline_version[0] == '\0') {
+        return 0;
+    }
+    if (floor_version[0] == '\0') {
+        (void)snprintf(floor_version, floor_size, "%s", baseline_version);
+        *floor_revision = baseline_revision;
+        return 0;
+    }
+    order = forge_version_compare(baseline_version, floor_version);
+    if (order > 0 ||
+        (order == 0 && baseline_revision > *floor_revision)) {
+        (void)snprintf(floor_version, floor_size, "%s", baseline_version);
+        *floor_revision = baseline_revision;
+    }
     return 0;
 }
 

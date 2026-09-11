@@ -342,6 +342,158 @@ static int version_is_valid(const char *version)
 }
 
 /*
+ * Total semver precedence for validated versions ("1.2.3", optional
+ * "-prerelease"): numeric MAJOR/MINOR/PATCH first, a release outranks any
+ * pre-release of the same core, and pre-release identifiers compare per
+ * semver 11.4 (numeric identifiers numerically and below alphanumeric
+ * ones, alphanumeric ones lexically, a longer set wins a shared prefix).
+ * A "+build" suffix is ignored, per semver 10. Returns -1/0/1.
+ * Inputs must pass version_is_valid (modulo a build suffix); anything else
+ * compares by fallback so resolution never spins on corrupt data.
+ */
+static int identifier_is_numeric(const char *text, size_t length)
+{
+    size_t index;
+
+    if (length == 0U) {
+        return 0;
+    }
+    for (index = 0U; index < length; ++index) {
+        if (!isdigit((unsigned char)text[index])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Numeric identifiers compare by value: leading zeros skipped, then the
+ * longer digit run wins, then lexicographic order decides. */
+static int compare_numeric_identifier(const char *a, size_t length_a,
+                                      const char *b, size_t length_b)
+{
+    int order;
+
+    while (length_a > 1U && a[0] == '0') {
+        ++a;
+        --length_a;
+    }
+    while (length_b > 1U && b[0] == '0') {
+        ++b;
+        --length_b;
+    }
+    if (length_a != length_b) {
+        return length_a < length_b ? -1 : 1;
+    }
+    order = memcmp(a, b, length_a);
+    return order < 0 ? -1 : (order > 0 ? 1 : 0);
+}
+
+static int compare_prerelease(const char *a, const char *b)
+{
+    for (;;) {
+        const char *dot_a;
+        const char *dot_b;
+        size_t length_a;
+        size_t length_b;
+        int numeric_a;
+        int numeric_b;
+
+        if (*a == '\0' && *b == '\0') {
+            return 0;
+        }
+        if (*a == '\0') {
+            return -1;
+        }
+        if (*b == '\0') {
+            return 1;
+        }
+        dot_a = strchr(a, '.');
+        dot_b = strchr(b, '.');
+        length_a = dot_a != NULL ? (size_t)(dot_a - a) : strlen(a);
+        length_b = dot_b != NULL ? (size_t)(dot_b - b) : strlen(b);
+        numeric_a = identifier_is_numeric(a, length_a);
+        numeric_b = identifier_is_numeric(b, length_b);
+        if (numeric_a && numeric_b) {
+            int order = compare_numeric_identifier(a, length_a, b, length_b);
+
+            if (order != 0) {
+                return order;
+            }
+        } else if (numeric_a) {
+            return -1;
+        } else if (numeric_b) {
+            return 1;
+        } else {
+            size_t shortest = length_a < length_b ? length_a : length_b;
+            int order = shortest == 0U ? 0 : memcmp(a, b, shortest);
+
+            if (order != 0) {
+                return order < 0 ? -1 : 1;
+            }
+            if (length_a != length_b) {
+                return length_a < length_b ? -1 : 1;
+            }
+        }
+        a += length_a + (dot_a != NULL ? 1U : 0U);
+        b += length_b + (dot_b != NULL ? 1U : 0U);
+    }
+}
+
+int forge_version_compare(const char *a, const char *b)
+{
+    unsigned long parts_a[3] = { 0U, 0U, 0U };
+    unsigned long parts_b[3] = { 0U, 0U, 0U };
+    const char *pre_a;
+    const char *pre_b;
+    char core_a[FORGE_MANIFEST_VALUE_MAX];
+    char core_b[FORGE_MANIFEST_VALUE_MAX];
+    size_t index;
+
+    if (a == NULL || b == NULL) {
+        return a == b ? 0 : (a == NULL ? -1 : 1);
+    }
+    /* A "+build" suffix never affects precedence (semver 10). */
+    (void)snprintf(core_a, sizeof(core_a), "%s", a);
+    (void)snprintf(core_b, sizeof(core_b), "%s", b);
+    {
+        char *build_a = strchr(core_a, '+');
+        char *build_b = strchr(core_b, '+');
+
+        if (build_a != NULL) {
+            *build_a = '\0';
+        }
+        if (build_b != NULL) {
+            *build_b = '\0';
+        }
+    }
+    /* sscanf never fails on validated versions; the fallback keeps the
+     * order total so resolution cannot spin on corrupt data. */
+    if (sscanf(core_a, "%lu.%lu.%lu", &parts_a[0], &parts_a[1], &parts_a[2]) != 3 ||
+        sscanf(core_b, "%lu.%lu.%lu", &parts_b[0], &parts_b[1], &parts_b[2]) != 3) {
+        int order = strcmp(a, b);
+
+        return order < 0 ? -1 : (order > 0 ? 1 : 0);
+    }
+    for (index = 0U; index < 3U; ++index) {
+        if (parts_a[index] != parts_b[index]) {
+            return parts_a[index] < parts_b[index] ? -1 : 1;
+        }
+    }
+    pre_a = strchr(core_a, '-');
+    pre_b = strchr(core_b, '-');
+    if (pre_a == NULL && pre_b == NULL) {
+        return 0;
+    }
+    if (pre_a == NULL) {
+        return 1;
+    }
+    if (pre_b == NULL) {
+        return -1;
+    }
+    return compare_prerelease(pre_a + 1U, pre_b + 1U);
+}
+
+/*
  * Parses a strict inline table: '{' key = "string" (, key = "string")* '}'.
  * Bare keys are short identifiers; values are quoted strings; trailing
  * commas are rejected like everywhere else in the manifest.
@@ -486,6 +638,8 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
             find_inline_entry(entries, count, "registry");
         const ForgeInlineEntry *version_entry =
             find_inline_entry(entries, count, "version");
+        const ForgeInlineEntry *min_version_entry =
+            find_inline_entry(entries, count, "min-version");
         int source_count = (entry != NULL) + (git_entry != NULL) +
                            (registry_entry != NULL);
 
@@ -499,6 +653,18 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
             forge_util_set_error(error, error_size,
                       "dependency '%s': version only applies to registry "
                       "dependencies", name);
+            return -1;
+        }
+        if (min_version_entry != NULL && registry_entry == NULL) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': min-version only applies to registry "
+                      "dependencies", name);
+            return -1;
+        }
+        if (min_version_entry != NULL && version_entry != NULL) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': use only one of version (exact pin) "
+                      "or min-version (minimum)", name);
             return -1;
         }
         if (registry_entry != NULL) {
@@ -536,6 +702,7 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
     dependency->path[0] = '\0';
     dependency->registry[0] = '\0';
     dependency->registry_version[0] = '\0';
+    dependency->registry_min_version[0] = '\0';
     if (entry != NULL) {
         if (find_inline_entry(entries, count, "tag") != NULL ||
             find_inline_entry(entries, count, "branch") != NULL ||
@@ -600,17 +767,34 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
                            sizeof(dependency->registry_version), "%s",
                            version_entry->value);
         }
+        {
+            const ForgeInlineEntry *min_entry =
+                find_inline_entry(entries, count, "min-version");
+
+            if (min_entry != NULL) {
+                if (!version_is_valid(min_entry->value)) {
+                    forge_util_set_error(error, error_size,
+                              "dependency '%s': min-version '%s' is not a "
+                              "valid version; use MAJOR.MINOR.PATCH",
+                              name, min_entry->value);
+                    return -1;
+                }
+                (void)snprintf(dependency->registry_min_version,
+                               sizeof(dependency->registry_min_version), "%s",
+                               min_entry->value);
+            }
+        }
     }
     /* Reject unknown keys so typos fail loudly. */
     for (index = 0U; index < count; ++index) {
         static const char *const allowed[] = {
             "path", "git", "tag", "branch", "rev", "submodules",
-            "registry", "version"
+            "registry", "version", "min-version"
         };
         size_t allowed_index;
         int known = 0;
 
-        for (allowed_index = 0U; allowed_index < 8U; ++allowed_index) {
+        for (allowed_index = 0U; allowed_index < 9U; ++allowed_index) {
             if (strcmp(entries[index].key, allowed[allowed_index]) == 0) {
                 known = 1;
                 break;

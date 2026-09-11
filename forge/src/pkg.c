@@ -367,54 +367,6 @@ static int insert_dependency_line(ForgeLineList *lines, const char *entry_line)
 }
 
 /* Removes the entry whose key equals `name`; returns 1 when removed. */
-/*
- * Asks the registry for the newest release of `package` (used when
- * `forge add --registry` omits --version, so the written entry is still
- * pinned). The resolve below re-verifies it before the pin is kept.
- */
-static int query_registry_latest(ForgeLogger *logger, const char *package,
-                                 char *version_out, size_t version_size,
-                                 char *error, size_t error_size)
-{
-    char cache_home[FORGE_PATH_MAX];
-    char registry_root[FORGE_PATH_MAX];
-    char tmp_path[FORGE_PATH_MAX];
-    ForgeRegistryPin pin;
-
-    if (forge_deps_cache_home(cache_home, sizeof(cache_home)) != 0) {
-        forge_util_set_error(error, error_size,
-                  "cannot resolve '%s': no dependency cache available",
-                  package);
-        return -1;
-    }
-    if (snprintf(registry_root, sizeof(registry_root), "%s/registry",
-                 cache_home) < 0 ||
-        strlen(cache_home) + 10U >= sizeof(registry_root) ||
-        forge_paths_ensure_directory(registry_root, error,
-                                     error_size) != 0) {
-        forge_util_set_error(error, error_size,
-                  "cannot resolve '%s': %s", package,
-                  error[0] != '\0' ? error : "dependency cache unavailable");
-        return -1;
-    }
-    if (snprintf(tmp_path, sizeof(tmp_path), "%s/.resolve.json.tmp",
-                 registry_root) < 0 ||
-        strlen(registry_root) + 19U >= sizeof(tmp_path)) {
-        forge_util_set_error(error, error_size, "registry cache path is too long");
-        return -1;
-    }
-    if (forge_registry_query(logger, package, "", tmp_path, &pin,
-                             error, error_size) != 0) {
-        return -1;
-    }
-    if (snprintf(version_out, version_size, "%s", pin.version) < 0 ||
-        strlen(pin.version) >= version_size) {
-        forge_util_set_error(error, error_size, "registry version is too long");
-        return -1;
-    }
-    return 0;
-}
-
 static int remove_dependency_line(ForgeLineList *lines, const char *name){
     int header = find_dependencies_header(lines);
     size_t index;
@@ -492,6 +444,7 @@ int forge_pkg_add(const char *manifest_path, const char *name,
                   const char *git_url, const char *ref_kind,
                   const char *ref_value, const char *dep_path,
                   const char *registry_package, const char *registry_version,
+                  const char *registry_min_version,
                   ForgeLogger *logger, char *error, size_t error_size)
 {
     static const char *const ref_kinds[] = { "tag", "branch", "rev" };
@@ -503,6 +456,7 @@ int forge_pkg_add(const char *manifest_path, const char *name,
     char *escaped_second = NULL;
     char *entry_line = NULL;
     char resolved_version[FORGE_MANIFEST_VALUE_MAX] = {0};
+    char resolved_min[FORGE_MANIFEST_VALUE_MAX] = {0};
     size_t needed;
     size_t index;
     int has_git = git_url != NULL && git_url[0] != '\0';
@@ -510,6 +464,7 @@ int forge_pkg_add(const char *manifest_path, const char *name,
     int has_registry = registry_package != NULL && registry_package[0] != '\0';
     int has_ref = ref_value != NULL && ref_value[0] != '\0';
     int has_reg_version = registry_version != NULL && registry_version[0] != '\0';
+    int has_reg_min = registry_min_version != NULL && registry_min_version[0] != '\0';
     const char *kind = ref_kind != NULL ? ref_kind : "";
 
     if (manifest_path == NULL || name == NULL) {
@@ -549,6 +504,16 @@ int forge_pkg_add(const char *manifest_path, const char *name,
                   "'%s': --version only applies to registry dependencies", name);
         return -1;
     }
+    if (has_reg_min && !has_registry) {
+        forge_util_set_error(error, error_size,
+                  "'%s': --min-version only applies to registry dependencies", name);
+        return -1;
+    }
+    if (has_reg_version && has_reg_min) {
+        forge_util_set_error(error, error_size,
+                  "'%s': use only one of --version/--min-version", name);
+        return -1;
+    }
     if (has_registry && !dependency_name_is_portable(registry_package)) {
         forge_util_set_error(error, error_size,
                   "'%s' is not a valid registry package name; use letters, "
@@ -584,8 +549,13 @@ int forge_pkg_add(const char *manifest_path, const char *name,
         }
     }
     if (has_registry) {
-        /* Pin the release now so the written entry is deterministic; the
-         * resolve below still verifies it and rolls back on failure. */
+        /*
+         * An exact pin is written verbatim; a minimum is written as
+         * min-version (validated when the manifest reloads below). A bare
+         * entry names no version at all and resolves to the baseline at
+         * resolve time. The resolve below verifies every shape and rolls
+         * back on failure.
+         */
         if (has_reg_version) {
             if (snprintf(resolved_version, sizeof(resolved_version), "%s",
                          registry_version) < 0 ||
@@ -593,11 +563,13 @@ int forge_pkg_add(const char *manifest_path, const char *name,
                 forge_util_set_error(error, error_size, "registry version is too long");
                 goto fail_before_write;
             }
-        } else if (query_registry_latest(logger, registry_package,
-                                         resolved_version,
-                                         sizeof(resolved_version), error,
-                                         error_size) != 0) {
-            goto fail_before_write;
+        } else if (has_reg_min) {
+            if (snprintf(resolved_min, sizeof(resolved_min), "%s",
+                         registry_min_version) < 0 ||
+                strlen(registry_min_version) >= sizeof(resolved_min)) {
+                forge_util_set_error(error, error_size, "registry version is too long");
+                goto fail_before_write;
+            }
         }
     }
 
@@ -606,27 +578,39 @@ int forge_pkg_add(const char *manifest_path, const char *name,
     if (has_ref) {
         escaped_ref = escape_manifest_string(ref_value);
     }
-    if (has_registry) {
+    if (has_reg_version) {
         escaped_second = escape_manifest_string(resolved_version);
+    } else if (has_reg_min) {
+        escaped_second = escape_manifest_string(resolved_min);
     }
     if (escaped_value == NULL ||
-        (has_ref && escaped_ref == NULL) ||
-        (has_registry && escaped_second == NULL)) {
+        ((has_reg_version || has_reg_min) && escaped_second == NULL) ||
+        (has_ref && escaped_ref == NULL)) {
         forge_util_set_error(error, error_size, "out of memory");
         goto fail_before_write;
     }
     needed = strlen(name) + strlen(escaped_value) + 48U +
              (has_ref ? strlen(kind) + strlen(escaped_ref) + 8U : 0U) +
-             (has_registry ? strlen(escaped_second) + 24U : 0U);
+             ((has_reg_version || has_reg_min) ? strlen(escaped_second) + 32U : 0U);
     entry_line = malloc(needed);
     if (entry_line == NULL) {
         forge_util_set_error(error, error_size, "out of memory");
         goto fail_before_write;
     }
     if (has_registry) {
-        (void)snprintf(entry_line, needed,
-                       "%s = { registry = \"%s\", version = \"%s\" }",
-                       name, escaped_value, escaped_second);
+        if (has_reg_version) {
+            (void)snprintf(entry_line, needed,
+                           "%s = { registry = \"%s\", version = \"%s\" }",
+                           name, escaped_value, escaped_second);
+        } else if (has_reg_min) {
+            (void)snprintf(entry_line, needed,
+                           "%s = { registry = \"%s\", min-version = \"%s\" }",
+                           name, escaped_value, escaped_second);
+        } else {
+            (void)snprintf(entry_line, needed,
+                           "%s = { registry = \"%s\" }",
+                           name, escaped_value);
+        }
     } else if (has_git) {
         if (has_ref) {
             (void)snprintf(entry_line, needed, "%s = { git = \"%s\", %s = \"%s\" }",

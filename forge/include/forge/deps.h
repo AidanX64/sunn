@@ -37,6 +37,11 @@ typedef struct ForgeDepNode {
     char source_ref[FORGE_MANIFEST_VALUE_MAX];
     char source_path[FORGE_PATH_MAX];
     int is_registry;
+    /* Registry nodes only: the resolved (version, revision) pair, so a
+     * later declaration carrying an exact pin or a minimum can be checked
+     * against what actually resolved rather than the declared spelling. */
+    char resolved_version[FORGE_MANIFEST_VALUE_MAX];
+    unsigned resolved_revision;
     ForgeManifest *manifest;
     int is_native;
     /* Filled by the build stage: native deps point at their objects.txt

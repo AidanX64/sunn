@@ -176,6 +176,14 @@ not send it yet.)
 
 Preserve this contract unless there is a concrete reason to version or replace it.
 
+The registry also serves a static `baseline.json` at the site root pinning
+the minimum (version, revision) per package (vcpkg-baseline semantics).
+Manifest entries use `version` for exact pins, `min-version` for minimums,
+or neither (bare entries track the baseline); recipes carry `revision` so a
+recipe fix ships without a new upstream release. All three are validated by
+`lib/sunn-registry.ts` and exercised by `forge/test/registry-regression.sh`
+(R2/R5/R10–R12).
+
 Native fixture packages are currently source packages. They are not production binary releases.
 
 Per-triplet binary artifacts are a future phase.

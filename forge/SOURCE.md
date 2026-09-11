@@ -24,14 +24,16 @@ M include/forge/deps.h
 M include/forge/manifest.h
 M include/forge/orchestrator.h
 M include/forge/pkg.h
+M src/cli.c
+M src/commands.c
+M src/deps.c
+M src/manifest.c
+M src/pkg.c
 M src/registry.c
 M test/deps-regression.sh
 ?? include/forge/fetch.h
 ?? include/forge/registry.h
 ?? include/forge/sha256.h
-?? src/fetch.c
-?? src/registry.c
-?? src/sha256.c
 ?? test/registry-regression.sh
 ?? test/regression.sh
 ```

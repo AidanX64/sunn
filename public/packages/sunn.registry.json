@@ -6,26 +6,47 @@
     {
       "name": "hello-asm",
       "latest": "0.1.0",
+      "latest_revision": 0,
       "description": "Minimal asm library fixture for the sunn native registry (ships objects, never a main).",
       "license": "MIT",
       "homepage": "https://example.com/hello-asm",
-      "index": "/packages/hello-asm/0.1.0.json"
+      "index": "/packages/hello-asm/0.1.0.json",
+      "versions": [
+        {
+          "version": "0.1.0",
+          "revision": 0
+        }
+      ]
     },
     {
       "name": "hello-c",
       "latest": "0.1.0",
+      "latest_revision": 0,
       "description": "Minimal c library fixture for the sunn native registry (ships objects, never a main).",
       "license": "MIT",
       "homepage": "https://example.com/hello-c",
-      "index": "/packages/hello-c/0.1.0.json"
+      "index": "/packages/hello-c/0.1.0.json",
+      "versions": [
+        {
+          "version": "0.1.0",
+          "revision": 0
+        }
+      ]
     },
     {
       "name": "hello-cpp",
       "latest": "0.1.0",
+      "latest_revision": 0,
       "description": "Minimal c++ library fixture for the sunn native registry (ships objects, never a main).",
       "license": "MIT",
       "homepage": "https://example.com/hello-cpp",
-      "index": "/packages/hello-cpp/0.1.0.json"
+      "index": "/packages/hello-cpp/0.1.0.json",
+      "versions": [
+        {
+          "version": "0.1.0",
+          "revision": 0
+        }
+      ]
     }
   ]
 }

@@ -11,6 +11,8 @@ import {
 
 // GET /api/forge/v1/resolve?name=hello-c&version=0.1.0
 // Resolve a native Forge recipe, not a Sunn-hosted artifact.
+// Omitting ?version= resolves the index latest; naming one resolves any
+// version the index lists for the package.
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url)
@@ -31,25 +33,28 @@ export async function GET(request: Request) {
     if (!entry) {
       return NextResponse.json({ error: "Package not found" }, { status: 404 })
     }
-    if (version && entry.latest !== version) {
+    const wanted = version ?? entry.latest
+    if (!entry.versions.some((v) => v.version === wanted)) {
+      const known = entry.versions.map((v) => v.version).join(", ") || entry.latest
       return NextResponse.json(
-        { error: `Only version ${entry.latest} hosted in static MVP` },
+        { error: `Version ${wanted} is not hosted for ${name}; known: ${known}` },
         { status: 404 }
       )
     }
-    const pkgPath = resolvePublicFile(entry.index)
+    const pkgPath = resolvePublicFile(`/packages/${name}/${wanted}.json`)
     if (!pkgPath) {
-      console.error(`Corrupt registry index pointer for package ${entry.name}`)
+      console.error(`Corrupt registry index pointer for package ${entry.name}@${wanted}`)
       return NextResponse.json({ error: "Something went wrong" }, { status: 500 })
     }
     const pkg = nativePackageSchema.parse(JSON.parse(await fs.readFile(pkgPath, "utf8")))
-    if (pkg.name !== entry.name || pkg.version !== entry.latest) {
-      console.error(`Registry drift: index points ${entry.name}@${entry.latest} at ${entry.index}`)
+    if (pkg.name !== entry.name || pkg.version !== wanted) {
+      console.error(`Registry drift: ${entry.name} index lists ${wanted} but the file disagrees`)
       return NextResponse.json({ error: "Something went wrong" }, { status: 500 })
     }
 
     return NextResponse.json({
       version: pkg.version,
+      revision: pkg.revision,
       source: pkg.source,
       patches: pkg.patches,
     })

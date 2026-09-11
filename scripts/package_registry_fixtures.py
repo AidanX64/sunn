@@ -36,6 +36,54 @@ def parse_scalar(text: str, key: str) -> str:
     return m.group(1) if m else ""
 
 
+def fixture_revision(fixture: Path) -> int:
+    """Recipe revision for a fixture (vcpkg port-version analog).
+
+    Read from an optional `<fixture>/.revision` sidecar so a recipe fix
+    (new tarball bytes for the same upstream version) becomes an
+    addressable, updatable pin without a version bump. Defaults to 0.
+    """
+    try:
+        raw = (fixture / ".revision").read_text().strip()
+    except FileNotFoundError:
+        return 0
+    if not raw.isdigit():
+        print(f"warn {fixture.name}: bad .revision {raw!r}, using 0", file=sys.stderr)
+        return 0
+    return min(int(raw), 1000000)
+
+
+def semver_sort_key(version: str) -> tuple:
+    """Descending-sort key: numeric MAJOR/MINOR/PATCH, release over prerelease."""
+    core, _, pre = version.partition("-")
+    try:
+        nums = tuple(int(p) for p in core.split("."))
+    except ValueError:
+        nums = (0,)
+    while len(nums) < 3:
+        nums = nums + (0,)
+    return (nums, 1 if not pre else 0, pre)
+
+
+def collect_versions(pkg_dir: Path) -> list[dict]:
+    """Merge every <version>.json on disk into a versions[] list, newest first."""
+    found = []
+    for cand in sorted(pkg_dir.glob("*.json")):
+        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", cand.stem):
+            continue
+        try:
+            data = json.loads(cand.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("version") != cand.stem:
+            continue
+        rev = data.get("revision", 0)
+        found.append({"version": cand.stem,
+                      "revision": rev if isinstance(rev, int) and rev >= 0 else 0})
+    found.sort(key=lambda e: semver_sort_key(e["version"]), reverse=True)
+    return found
+
+
 def main() -> int:
     if not FIXTURES.is_dir():
         print(f"no fixtures dir: {FIXTURES}", file=sys.stderr)
@@ -58,6 +106,7 @@ def main() -> int:
         cpp = parse_toml_list(manifest, r"\bcpp\b")
         asm = parse_toml_list(manifest, r"\basm\b")
         lang = "c" if c else ("c++" if cpp else "asm")
+        rev = fixture_revision(fixture)
         pkg_dir = OUT / name
         pkg_dir.mkdir(parents=True, exist_ok=True)
         tarball = pkg_dir / f"{name}-{version}.tar.gz"
@@ -74,6 +123,7 @@ def main() -> int:
         pkg_json = {
             "name": name,
             "version": version,
+            "revision": rev,
             "description": f"Minimal {lang} library fixture for the sunn native registry (ships objects, never a main).",
             "license": "MIT",
             "homepage": "https://example.com/" + name,
@@ -86,19 +136,34 @@ def main() -> int:
         }
         (pkg_dir / f"{version}.json").write_text(json.dumps(pkg_json, indent=2) + "\n")
         (pkg_dir / "Forge.toml").write_text(manifest)
+        versions = collect_versions(pkg_dir)
+        newest = versions[0] if versions else {"version": version, "revision": rev}
         entries[name] = {
             "name": name,
-            "latest": version,
+            "latest": newest["version"],
+            "latest_revision": newest["revision"],
             "description": pkg_json["description"],
             "license": "MIT",
             "homepage": pkg_json["homepage"],
-            "index": f"/packages/{name}/{version}.json",
+            "index": f"/packages/{name}/{newest['version']}.json",
+            "versions": versions,
         }
-        print(f"{name} {version}: {tarball.name} sha256={sha256[:16]}...")
+        print(f"{name} {version} rev {rev}: {tarball.name} sha256={sha256[:16]}...")
 
     index["packages"] = [entries[k] for k in sorted(entries)]
     index_path.write_text(json.dumps(index, indent=2) + "\n")
     print(f"index: {index_path} ({len(entries)} packages)")
+    baseline = {
+        "name": "sunn-native-baseline",
+        "baseline": [
+            {"name": k, "version": entries[k]["latest"],
+             "revision": entries[k]["latest_revision"]}
+            for k in sorted(entries)
+        ],
+    }
+    baseline_path = OUT.parent / "baseline.json"
+    baseline_path.write_text(json.dumps(baseline, indent=2) + "\n")
+    print(f"baseline: {baseline_path} ({len(entries)} pins)")
     return 0
 
 

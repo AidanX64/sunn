@@ -1,6 +1,7 @@
 {
   "name": "hello-cpp",
   "version": "0.1.0",
+  "revision": 0,
   "description": "Minimal c++ library fixture for the sunn native registry (ships objects, never a main).",
   "license": "MIT",
   "homepage": "https://example.com/hello-cpp",

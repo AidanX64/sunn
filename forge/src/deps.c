@@ -40,7 +40,8 @@
 #define FORGE_LOCK_LINE_MAX 4096U
 
 /* One pinned dependency as recorded in Forge.lock. Plain git entries retain
- * their historical shape; registry entries carry an explicit source kind. */
+ * their historical shape; registry entries carry an explicit source kind.
+ * Registry revision 0 doubles as "predates revisions" for old lockfiles. */
 typedef struct ForgeLockEntry {
     char name[FORGE_DEPS_VALUE_MAX];
     char commit[FORGE_DEPS_VALUE_MAX];
@@ -50,6 +51,7 @@ typedef struct ForgeLockEntry {
     char sha256[FORGE_DEPS_VALUE_MAX];
     char kind[8];
     char location[FORGE_PATH_MAX];
+    unsigned revision;
 } ForgeLockEntry;
 
 typedef struct ForgeLockFile {
@@ -778,9 +780,9 @@ static int write_lockfile_body(void *user_data, FILE *file)
                 return -1;
             }
         } else {
-            if (fprintf(file, "%s = { kind = \"%s\", version = \"%s\", location = \"%s\", sha256 = \"%s\" }\n",
+            if (fprintf(file, "%s = { kind = \"%s\", version = \"%s\", location = \"%s\", sha256 = \"%s\", revision = \"%u\" }\n",
                         entry->name, entry->kind, entry->version,
-                        entry->location, entry->sha256) < 0) {
+                        entry->location, entry->sha256, entry->revision) < 0) {
                 return -1;
             }
         }
@@ -827,6 +829,31 @@ static int is_full_sha256(const char *text)
             return 0;
         }
     }
+    return 1;
+}
+
+/*
+ * Registry recipe revisions are small decimal integers (shared bound with
+ * the registry schema). Absent in old lockfiles, where revision 0 applies.
+ */
+static int lock_revision_is_valid(const char *text, unsigned *out)
+{
+    unsigned long value = 0UL;
+    size_t index;
+
+    if (text == NULL || text[0] == '\0') {
+        return 0;
+    }
+    for (index = 0U; text[index] != '\0'; ++index) {
+        if (!isdigit((unsigned char)text[index])) {
+            return 0;
+        }
+        value = value * 10UL + (unsigned long)(text[index] - '0');
+        if (value > FORGE_REGISTRY_MAX_REVISION) {
+            return 0;
+        }
+    }
+    *out = (unsigned)value;
     return 1;
 }
 
@@ -936,6 +963,15 @@ static int load_lockfile(const char *path, ForgeLockFile *lock,
                 (void)snprintf(entry->kind, sizeof(entry->kind), "%s", value);
             } else if (strcmp(key_start, "location") == 0) {
                 (void)snprintf(entry->location, sizeof(entry->location), "%s", value);
+            } else if (strcmp(key_start, "revision") == 0) {
+                if (!lock_revision_is_valid(value, &entry->revision)) {
+                    forge_util_set_error(error, error_size,
+                              "%s: dependency '%s' has a malformed registry pin; "
+                              "delete Forge.lock and run 'forge update' to regenerate it",
+                              path, entry->name);
+                    (void)fclose(file);
+                    return -1;
+                }
             }
             cursor = quote + 1;
         }
@@ -1147,10 +1183,13 @@ static int consumer_root_is_cached(const char *consumer_root)
 
 /*
  * Two declarations of the same dependency name may only coexist when they
- * name the same source: identical git URL and ref pair, identical registry
- * package and version, or the same resolved directory for path deps.
- * Anything else used to silently resolve to whichever declaration happened
- * to resolve first. Returns 0 when the sources agree, -1 with a short
+ * name the same source: identical git URL and ref pair, the same registry
+ * package with compatible versions, or the same resolved directory for
+ * path deps. Registry compatibility is checked against what actually
+ * resolved: exact pins must equal the resolved version, minimums must be
+ * satisfied by it, and bare declarations float onto anything. Anything
+ * else used to silently resolve to whichever declaration happened to be
+ * resolved first. Returns 0 when the sources agree, -1 with a short
  * explanation of the difference in `reason`.
  */
 static int dep_identity_conflicts(const ForgeDepNode *node,
@@ -1182,12 +1221,29 @@ static int dep_identity_conflicts(const ForgeDepNode *node,
                       node->source_url, dependency->registry);
             return -1;
         }
-        if (strcmp(node->source_ref, dependency->registry_version) != 0) {
+        if (dependency->registry_version[0] != '\0') {
+            if (strcmp(node->resolved_version,
+                       dependency->registry_version) != 0) {
+                forge_util_set_error(reason, reason_size,
+                          "registry versions differ (resolved '%s' vs "
+                          "required '%s')",
+                          node->resolved_version[0] != '\0' ?
+                              node->resolved_version : "<latest>",
+                          dependency->registry_version);
+                return -1;
+            }
+            return 0;
+        }
+        if (dependency->registry_min_version[0] != '\0' &&
+            (node->resolved_version[0] == '\0' ||
+             forge_version_compare(node->resolved_version,
+                                   dependency->registry_min_version) < 0)) {
             forge_util_set_error(reason, reason_size,
-                      "registry versions differ ('%s' vs '%s')",
-                      node->source_ref[0] != '\0' ? node->source_ref : "<latest>",
-                      dependency->registry_version[0] != '\0' ?
-                          dependency->registry_version : "<latest>");
+                      "registry version '%s' is below the required minimum "
+                      "'%s'",
+                      node->resolved_version[0] != '\0' ?
+                          node->resolved_version : "<latest>",
+                      dependency->registry_min_version);
             return -1;
         }
         return 0;
@@ -1367,7 +1423,11 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
         int is_native;
         int dep_force;
         size_t stack_index;
+        /* Registry resolution outcome, carried to node creation below. */
+        char resolved_version[FORGE_MANIFEST_VALUE_MAX];
+        unsigned resolved_revision = 0U;
 
+        resolved_version[0] = '\0';
         /* Cycle check along the current path. */
         for (stack_index = 0U; (int)stack_index < depth; ++stack_index) {
             if (strcmp(names[stack_index], dependency->name) == 0) {
@@ -1483,12 +1543,14 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
             fetch_status = forge_registry_materialize(
                 context->logger, dependency->name, dependency->registry,
                 dependency->registry_version,
+                dependency->registry_min_version,
                 locked != NULL ? locked->version : "",
                 locked != NULL ? locked->kind : "",
                 locked != NULL ? locked->location : "",
                 locked != NULL ? locked->ref : "",
                 locked != NULL ? locked->commit : "",
                 locked != NULL ? locked->sha256 : "",
+                locked != NULL ? locked->revision : 0U,
                 dep_force, context->offline, package_dir,
                 root, sizeof(root), &pin, &reused,
                 context->error, sizeof(context->error));
@@ -1506,6 +1568,9 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                           dependency->name);
                 return -1;
             }
+            (void)snprintf(resolved_version, sizeof(resolved_version), "%s",
+                           pin.version);
+            resolved_revision = pin.revision;
 
             /* Record/update the pin; a kind change from git silently
              * converts, exactly like a changed git URL does — the
@@ -1525,13 +1590,15 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                 strcmp(locked->location, pin.location) != 0 ||
                 strcmp(locked->ref, pin.ref) != 0 ||
                 strcmp(locked->commit, pin.commit) != 0 ||
-                strcmp(locked->sha256, pin.sha256) != 0) {
+                strcmp(locked->sha256, pin.sha256) != 0 ||
+                locked->revision != pin.revision) {
                 (void)snprintf(locked->kind, sizeof(locked->kind), "%s", pin.kind);
                 (void)snprintf(locked->version, sizeof(locked->version), "%s", pin.version);
                 (void)snprintf(locked->location, sizeof(locked->location), "%s", pin.location);
                 (void)snprintf(locked->ref, sizeof(locked->ref), "%s", pin.ref);
                 (void)snprintf(locked->commit, sizeof(locked->commit), "%s", pin.commit);
                 (void)snprintf(locked->sha256, sizeof(locked->sha256), "%s", pin.sha256);
+                locked->revision = pin.revision;
                 context->lock_dirty = 1;
             }
             is_native = dir_has_file(root, "Forge.toml");
@@ -1685,12 +1752,17 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
         node->source_ref[0] = '\0';
         node->source_path[0] = '\0';
         node->is_registry = 0;
+        node->resolved_version[0] = '\0';
+        node->resolved_revision = 0U;
         if (dependency->registry[0] != '\0') {
             (void)snprintf(node->source_url, sizeof(node->source_url), "%s",
                            dependency->registry);
             (void)snprintf(node->source_ref, sizeof(node->source_ref), "%s",
                            dependency->registry_version);
             node->is_registry = 1;
+            (void)snprintf(node->resolved_version, sizeof(node->resolved_version),
+                           "%s", resolved_version);
+            node->resolved_revision = resolved_revision;
         } else if (dependency->git_url[0] != '\0') {
             (void)snprintf(node->source_url, sizeof(node->source_url), "%s",
                            dependency->git_url);

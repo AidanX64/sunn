@@ -23,13 +23,16 @@ int forge_orchestrate_test(const char *manifest_path, const ForgeBuildOptions *o
 int forge_orchestrate_update(const char *manifest_path, const char *only_name,
                              int offline);
 /* Adds a [dependencies] entry (git, path, or registry source) and
- * re-resolves pins. `registry_version` "" tracks the newest registry
- * release at add time (the resolved version is still pinned). */
+ * re-resolves pins. `registry_version` pins one release exactly;
+ * `registry_min_version` sets a minimum ("" for both tracks the registry
+ * baseline, newest when the registry states none). At most one of the two
+ * may be non-empty. */
 int forge_orchestrate_add(const char *manifest_path, const char *name,
                           const char *git_url, const char *ref_kind,
                           const char *ref_value, const char *dep_path,
                           const char *registry_package,
-                          const char *registry_version);
+                          const char *registry_version,
+                          const char *registry_min_version);
 /* Removes a [dependencies] entry and prunes its pin from Forge.lock. */
 int forge_orchestrate_remove(const char *manifest_path, const char *name);
 int forge_orchestrate_debug(const char *manifest_path, const ForgeBuildOptions *options);
