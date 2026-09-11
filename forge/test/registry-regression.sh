@@ -26,6 +26,14 @@
 # loopback in R9.
 set -u
 
+replace_in_file() {
+    if sed --version >/dev/null 2>&1; then
+        sed -i "$1" "$2"
+    else
+        sed -i '' "$1" "$2"
+    fi
+}
+
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 
@@ -250,7 +258,7 @@ pass "R3 offline reuse + cold-cache failure"
 (cd "$work/c1" && "$FORGE" build >/dev/null 2>&1) \
     || fail "R4 setup: rebuild after cache wipe failed"
 if command -v sed >/dev/null 2>&1; then
-    sed -i "s/$sha010/0000000000000000000000000000000000000000000000000000000000000000/" \
+    replace_in_file "s/$sha010/0000000000000000000000000000000000000000000000000000000000000000/" \
         "$work/c1/Forge.lock"
 else
     python3 - "$work/c1/Forge.lock" "$sha010" <<'PYEOF'
@@ -295,7 +303,7 @@ grep -q 'version = "0.3.0"' "$work/c2/Forge.toml" \
 grep -q "sha256 = \"$sha010\"" "$work/c1/Forge.lock" \
     || fail "R5: update moved an exact pin"
 # --locked refuses a manifest edit that would move a pin.
-sed -i 's/registry = "hello_c", version = "0.1.0"/registry = "hello_c", version = "0.3.0"/' "$work/c1/Forge.toml"
+replace_in_file 's/registry = "hello_c", version = "0.1.0"/registry = "hello_c", version = "0.3.0"/' "$work/c1/Forge.toml"
 if (cd "$work/c1" && "$FORGE" build --locked >/dev/null 2>&1); then
     fail "R5: --locked should refuse a pin move"
 fi

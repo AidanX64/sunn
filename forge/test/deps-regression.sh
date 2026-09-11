@@ -23,6 +23,14 @@
 # FORGE_ALLOW_UNSAFE_GIT=1 (exactly the opt-out real users would use).
 set -u
 
+replace_in_file() {
+    if sed --version >/dev/null 2>&1; then
+        sed -i "$1" "$2"
+    else
+        sed -i '' "$1" "$2"
+    fi
+}
+
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 
@@ -213,7 +221,7 @@ pinned_s2="$(git -C "$dep" rev-parse HEAD)"
 grep -q "commit = \"$pinned_s2\"" Forge.lock \
     || fail "S2: pin was not recorded"
 
-sed -i "s/commit = \"$pinned_s2\"/commit = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbe\"/" Forge.lock
+replace_in_file "s/commit = \"$pinned_s2\"/commit = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbe\"/" Forge.lock
 if "$FORGE" build >"$work/out.txt" 2>&1; then
     fail "S2: tampered commit pin was accepted"
 fi
@@ -309,7 +317,7 @@ rm -f Forge.lock
 write_project_manifest "$proj/Forge.toml" "m5b" \
     "sharedm5 = { git = \"$work_forge/dep-m5a\", branch = \"master\" }" \
     "consumer = { path = \"$work_forge/lib-consumer\" }"
-sed -i "s|dep-m5b|dep-m5a|" "$consumer/Forge.toml"
+replace_in_file "s|dep-m5b|dep-m5a|" "$consumer/Forge.toml"
 git_commit_all "$consumer" "agree on the shared source"
 "$FORGE" update >/dev/null 2>&1 \
     || fail "M5: agreeing diamond was rejected"
