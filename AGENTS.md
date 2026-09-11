@@ -168,8 +168,11 @@ lib/sunn-registry.ts
 Forge currently resolves native packages through:
 
 ```text
-GET /api/forge/v1/resolve?name=&version=&triplet=
+GET /api/forge/v1/resolve?name=&version=
 ```
+
+(`&triplet=` is reserved for the upcoming triplet phase; the client does
+not send it yet.)
 
 Preserve this contract unless there is a concrete reason to version or replace it.
 
@@ -179,7 +182,8 @@ Per-triplet binary artifacts are a future phase.
 
 ## Forge source of truth
 
-`forge/` is a vendored copy of the standalone Forge repository.
+`forge/` is a vendored copy of the standalone Forge repository
+(`https://github.com/AidanX64/forge.git`, branch `master`).
 
 The upstream Forge repository is the source of truth.
 

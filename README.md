@@ -90,7 +90,7 @@ external dependencies without merging into the native package schema.
 - `/api/packages` — native package metadata
   (`?q=&lang=&triplet=`).
 - `/api/forge/v1/resolve` — the contract the forge CLI resolves
-  against (`?name=&version=&triplet=`).
+  against (`?name=&version=`; `&triplet=` arrives with the triplet phase).
 
 ## Layout
 
@@ -145,7 +145,8 @@ local mirrors and tests with `FORGE_ALLOW_UNSAFE_REGISTRY=1`.
 
 ## Native Forge (vendored)
 
-`forge/` is a clean copy of the standalone native Forge repo; upstream stays
+`forge/` is a clean copy of the standalone native Forge repo
+(`https://github.com/AidanX64/forge.git`, branch `master`); upstream stays
 the source of truth, so edit there and re-sync — never the reverse:
 
 ```sh
