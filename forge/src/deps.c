@@ -2067,7 +2067,11 @@ static int marker_record_approval(const char *path)
     int fd = _open(path, _O_WRONLY | _O_CREAT | _O_EXCL,
                    _S_IREAD | _S_IWRITE);
 #else
-    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    int flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int fd = open(path, flags, 0600);
 #endif
     FILE *file;
 
