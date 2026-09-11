@@ -110,6 +110,11 @@ pass() {
 }
 
 # --- stub registry ----------------------------------------------------
+# Default features blob when FEATURES_JSON is unset. Kept in a variable so
+# the inner quotes are data: quotes written literally in a :- default are
+# syntactic and get quote-removed on some shells (macOS bash 3.2), which
+# used to emit bare keys and invalid JSON.
+FEATURES_JSON_DEFAULT='"features": [], "default-features": []'
 # make_registry_pkg <name> <version> <retval> [revision]: (re)builds one
 # stub package (lib sources + tarball + JSON), then refreshes the index.
 make_registry_pkg() {
@@ -160,9 +165,6 @@ EOF
     tar -czf "$out/$name-$version.tar.gz" -C "$src" Forge.toml include src
     local sha
     sha="$(sha256_of "$out/$name-$version.tar.gz")"
-    # NB: the inner quotes below are backslash-escaped so they survive the
-    # expansion (unescaped quotes in a :- default are syntactic and get
-    # quote-removed, which used to emit bare keys and invalid JSON).
     cat >"$out/$version.json" <<EOF
 {
   "name": "$name",
@@ -176,7 +178,7 @@ EOF
   "dependencies": [],
   "source": {"kind": "url", "location": "/packages/$name/$name-$version.tar.gz", "sha256": "$sha"},
   "patches": [],
-  ${FEATURES_JSON:-\"features\": [], \"default-features\": []},
+  ${FEATURES_JSON:-$FEATURES_JSON_DEFAULT},
   "forge": {"manifest": "/packages/$name/Forge.toml"}
 }
 EOF
@@ -273,8 +275,8 @@ sha010="$(make_registry_pkg hello_c 0.1.0 42)"
 make_consumer "$work/c1" '#include <stdio.h>
 #include "hello_c.h"
 int main(void) { printf("%d\n", hello_c_value()); return hello_c_value(); }'
-(cd "$work/c1" && "$FORGE" add greeting --registry hello_c --version 0.1.0 >/dev/null 2>&1) \
-    || fail "R1: add --registry failed"
+(cd "$work/c1" && "$FORGE" add greeting --registry hello_c --version 0.1.0 >"$work/r1.log" 2>&1) \
+    || { cat "$work/r1.log"; fail "R1: add --registry failed"; }
 grep -q 'greeting = { registry = "hello_c", version = "0.1.0" }' "$work/c1/Forge.toml" \
     || fail "R1: manifest entry not pinned"
 grep -q "greeting = .*kind = \"url\".*version = \"0.1.0\".*sha256 = \"$sha010\"" "$work/c1/Forge.lock" \

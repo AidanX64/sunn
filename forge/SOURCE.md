@@ -6,7 +6,7 @@ edit upstream and re-sync.
 
 - Upstream repo: `https://github.com/AidanX64/forge.git` (branch `master`)
 - Local checkout: `C:\Users\dooms\source\forge`
-- Upstream HEAD: `9655d9b0ad3c641c7dfedf5b5bac056afd0c877e`
+- Upstream HEAD: `32ce436416275520176da2abb1392749dc94c899`
 - Upstream status at copy time: clean
 - Copied: 2026-09-11 (robocopy, working tree)
 - Excluded from copy: `.git/`, `.github/`, `build/`, `target/`, `test/target/`, `*.exe`, `*.o`, `*.obj`, `*.a`, `*.lib`, `.scratch/`, `.opencode/`, `examples/`
