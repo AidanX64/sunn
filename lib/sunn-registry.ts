@@ -37,6 +37,41 @@ const sha256Schema = z
 
 const revisionSchema = z.number().int().min(0).max(1000000).default(0)
 
+const featureNameSchema = z
+  .string()
+  .min(1)
+  .max(32)
+  .regex(/^[A-Za-z0-9_-]+$/, "invalid feature name")
+
+// Optional transitive dependencies switched on by a feature.
+// Registry-only (like the top-level `dependencies` names, which stay
+// bare for backwards compatibility); at most one of version/min-version,
+// neither meaning the baseline.
+const featureDepSchema = z
+  .object({
+    registry: packageNameSchema,
+    version: packageVersionSchema.optional(),
+    "min-version": packageVersionSchema.optional(),
+  })
+  .strict()
+  .refine((d) => d.version === undefined || d["min-version"] === undefined, {
+    message: "feature dependency takes at most one of version/min-version",
+  })
+
+const featureSchema = z
+  .object({
+    name: featureNameSchema,
+    description: z.string().max(512).default(""),
+    cflags: z.array(z.string().min(1).max(512)).max(8).default([]),
+    dependencies: z.array(featureDepSchema).max(4).default([]),
+  })
+  .strict()
+
+// Feature definitions as an array (not a map) so the C client's
+// key-seeking JSON reader can walk them with its existing span pattern.
+// Unique names enforced below; defaults must name defined features.
+const featuresSchema = z.array(featureSchema).max(8).default([])
+
 const homepageSchema = z
   .string()
   .max(2048)
@@ -91,9 +126,28 @@ export const nativePackageSchema = z
     dependencies: z.array(packageNameSchema).max(100).default([]),
     source: registrySourceSchema,
     patches: z.array(patchNameSchema).max(32).default([]),
+    features: featuresSchema,
+    "default-features": z.array(featureNameSchema).max(8).default([]),
     forge: z.object({ manifest: manifestPathSchema }).strict().optional(),
   })
   .strict()
+  .superRefine((pkg, ctx) => {
+    const defined = new Set(pkg.features.map((f) => f.name))
+    if (defined.size !== pkg.features.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "feature names must be unique",
+      })
+    }
+    for (const name of pkg["default-features"]) {
+      if (!defined.has(name)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `default feature '${name}' is not defined in features`,
+        })
+      }
+    }
+  })
 
 export type NativePackage = z.infer<typeof nativePackageSchema>
 

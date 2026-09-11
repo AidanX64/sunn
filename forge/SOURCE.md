@@ -6,9 +6,9 @@ edit upstream and re-sync.
 
 - Upstream repo: `https://github.com/AidanX64/forge.git` (branch `master`)
 - Local checkout: `C:\Users\dooms\source\forge`
-- Upstream HEAD: `4711b10c3ea006de262a1e27d22f9d34a8c49ee9`
-- Upstream status at copy time: dirty (see below)
-- Copied: 2026-09-10 (robocopy, working tree)
+- Upstream HEAD: `9655d9b0ad3c641c7dfedf5b5bac056afd0c877e`
+- Upstream status at copy time: clean
+- Copied: 2026-09-11 (robocopy, working tree)
 - Excluded from copy: `.git/`, `.github/`, `build/`, `target/`, `test/target/`, `*.exe`, `*.o`, `*.obj`, `*.a`, `*.lib`, `.scratch/`, `.opencode/`, `examples/`
 - CI ownership: upstream keeps its own `.github/`; `sunn/.github/workflows/ci.yml`
 - is the only CI in this repo and tests the vendored tree as integrated.
@@ -16,29 +16,10 @@ edit upstream and re-sync.
 Upstream `git status --short` at copy time:
 
 ```text
-M .github/workflows/ci.yml
-M AGENTS.md
-M Makefile
-M README.md
-M include/forge/deps.h
-M include/forge/manifest.h
-M include/forge/orchestrator.h
-M include/forge/pkg.h
-M src/cli.c
-M src/commands.c
-M src/deps.c
-M src/manifest.c
-M src/pkg.c
-M src/registry.c
-M test/deps-regression.sh
-?? include/forge/fetch.h
-?? include/forge/registry.h
-?? include/forge/sha256.h
-?? test/registry-regression.sh
-?? test/regression.sh
+(clean)
 ```
 
-Note: this snapshot includes the uncommitted sunn-registry client
+Note: this snapshot includes the committed sunn-registry client
 (`registry = "pkg"` deps, tarball download + sha256 verify, registry
 Forge.lock pins, `forge add --registry/--version`,
 `test/registry-regression.sh`, Makefile header tracking). The untracked

@@ -13,10 +13,12 @@
 #include "forge_util.h"
 
 /* Spawns argv (already finalized) and maps the outcome onto 0/-1 with a
- * readable error. Command lines go through forge_logger_command so -vv
- * shows exactly what ran; failures name the tool and its exit code. */
+ * readable error. `work_dir` (NULL to inherit) becomes the child's working
+ * directory; command lines go through forge_logger_command so -vv shows
+ * exactly what ran; failures name the tool and its exit code. */
 static int run_tool(ForgeLogger *logger, const char *tool,
-                    ForgeArgv *argv, char *error, size_t error_size)
+                    ForgeArgv *argv, const char *work_dir, char *error,
+                    size_t error_size)
 {
     char display[FORGE_PATH_MAX * 2U];
     int exit_code = 0;
@@ -30,8 +32,8 @@ static int run_tool(ForgeLogger *logger, const char *tool,
     if (forge_argv_join(display, sizeof(display), argv) == 0) {
         forge_logger_command(logger, "deps", "%s", display);
     }
-    status = forge_process_run(argv->items, NULL, 0, &exit_code, error,
-                               error_size);
+    status = forge_process_run_at(work_dir, argv->items, NULL, 0,
+                                   &exit_code, error, error_size);
     if (status != 0) {
         return -1;
     }
@@ -213,7 +215,7 @@ static int download_with_curl(ForgeLogger *logger, const char *url,
         return -1;
     }
     forge_logger_detail(logger, "deps", "downloading %s", url);
-    status = run_tool(logger, "curl", &argv, error, error_size);
+    status = run_tool(logger, "curl", &argv, NULL, error, error_size);
     forge_argv_free(&argv);
     return status;
 }
@@ -246,7 +248,7 @@ static int download_with_powershell(ForgeLogger *logger, const char *url,
         return -1;
     }
     forge_logger_detail(logger, "deps", "downloading %s", url);
-    status = run_tool(logger, "powershell", &argv, error, error_size);
+    status = run_tool(logger, "powershell", &argv, NULL, error, error_size);
     forge_argv_free(&argv);
     return status;
 }
@@ -312,20 +314,66 @@ static int tar_member_is_safe(const char *member)
     }
 }
 
+/* Splits `path` into its containing directory and bare file name. GNU tar
+ * parses an absolute Windows path ("C:/..." or "C:\...") as a remote
+ * "host:file", so tar always runs with the archive's directory as its
+ * working directory and the bare name as its operand: that spelling is
+ * local on every tar (GNU, bsdtar) on every platform. The directory keeps
+ * its original separators (child cwd resolution is a native API call, not
+ * tar's host:file parser). */
+static void split_archive_path(const char *path, char *dir_out,
+                               size_t dir_size, const char **base_out)
+{
+    const char *slash = strrchr(path, '/');
+    const char *backslash = strrchr(path, '\\');
+    const char *base = slash;
+    size_t length;
+
+    if (backslash != NULL && (base == NULL || backslash > base)) {
+        base = backslash;
+    }
+    if (base == NULL) {
+        if (dir_size != 0U) {
+            dir_out[0] = '\0';
+        }
+        *base_out = path;
+        return;
+    }
+    length = (size_t)(base - path);
+    if (length >= dir_size) {
+        length = dir_size - 1U;
+    }
+    if (dir_size != 0U) {
+        memcpy(dir_out, path, length);
+        dir_out[length] = '\0';
+        if (dir_out[0] == '\0') {
+            dir_out[0] = '.';
+            dir_out[1] = '\0';
+        }
+    }
+    *base_out = base + 1U;
+}
+
 /* Runs `tar -t[z]f <archive>` (plus -v for the type listing), capturing the
- * listing to `list_path` for validation. */
+ * listing to `list_path` for validation. The child runs in the archive's
+ * directory with the bare file name (see split_archive_path); `list_path`
+ * stays absolute since redirection is a native call. */
 static int tar_capture_listing(ForgeLogger *logger, const char *archive,
                                const char *list_path, int verbose,
                                char *error, size_t error_size)
 {
     ForgeArgv argv = {0};
+    char archive_dir[FORGE_PATH_MAX];
+    const char *archive_base;
     int exit_code = 0;
     int status;
 
     (void)logger;
+    split_archive_path(archive, archive_dir, sizeof(archive_dir),
+                       &archive_base);
     if (forge_argv_append(&argv, "tar") != 0 ||
         forge_argv_append(&argv, verbose ? "-tvzf" : "-tzf") != 0 ||
-        forge_argv_append(&argv, archive) != 0) {
+        forge_argv_append(&argv, archive_base) != 0) {
         forge_argv_free(&argv);
         forge_util_set_error(error, error_size,
                   "out of memory while building a tar command");
@@ -337,8 +385,9 @@ static int tar_capture_listing(ForgeLogger *logger, const char *archive,
                   "out of memory while building a tar command");
         return -1;
     }
-    status = forge_process_run(argv.items, list_path, 0, &exit_code, error,
-                               error_size);
+    status = forge_process_run_at(archive_dir[0] == '\0' ? NULL : archive_dir,
+                                argv.items, list_path, 0, &exit_code, error,
+                                error_size);
     forge_argv_free(&argv);
     if (status != 0) {
         return -1;
@@ -473,6 +522,8 @@ int forge_fetch_unpack_tar_gz(ForgeLogger *logger, const char *archive,
     ForgeArgv argv = {0};
     char members_path[FORGE_PATH_MAX];
     char types_path[FORGE_PATH_MAX];
+    char archive_dir[FORGE_PATH_MAX];
+    const char *archive_base;
     int status;
 
     if (archive == NULL || dest_dir == NULL) {
@@ -511,9 +562,11 @@ int forge_fetch_unpack_tar_gz(ForgeLogger *logger, const char *archive,
     }
     (void)remove(members_path);
     (void)remove(types_path);
+    split_archive_path(archive, archive_dir, sizeof(archive_dir),
+                       &archive_base);
     if (forge_argv_append(&argv, "tar") != 0 ||
         forge_argv_append(&argv, "-xzf") != 0 ||
-        forge_argv_append(&argv, archive) != 0 ||
+        forge_argv_append(&argv, archive_base) != 0 ||
         forge_argv_append(&argv, "-C") != 0 ||
         forge_argv_append(&argv, dest_dir) != 0) {
         forge_argv_free(&argv);
@@ -522,7 +575,9 @@ int forge_fetch_unpack_tar_gz(ForgeLogger *logger, const char *archive,
         return -1;
     }
     forge_logger_detail(logger, "deps", "unpacking %s", archive);
-    status = run_tool(logger, "tar", &argv, error, error_size);
+    status = run_tool(logger, "tar", &argv,
+                      archive_dir[0] == '\0' ? NULL : archive_dir, error,
+                      error_size);
     forge_argv_free(&argv);
     return status;
 }

@@ -404,20 +404,33 @@ static int remove_dependency_line(ForgeLineList *lines, const char *name){
 static int resolve_after_edit(const char *manifest_path, ForgeLogger *logger,
                               char *error, size_t error_size)
 {
-    ForgeManifest manifest;
-    ForgeDepGraph graph = {0};
+    /* Heap, not stack: ForgeManifest (~350KB) plus ForgeDepGraph (~640KB)
+     * nest inside forge_pkg_add's own manifest, and the resolver below
+     * materializes packages (more frames) before the next manifest load.
+     * That ~1.4MB used to overflow the Windows stack mid-resolve. */
+    ForgeManifest *manifest = calloc(1U, sizeof(*manifest));
+    ForgeDepGraph *graph = calloc(1U, sizeof(*graph));
     char root[FORGE_PATH_MAX];
     int status = -1;
 
-    if (forge_manifest_load(manifest_path, &manifest, error, error_size) != 0) {
+    if (manifest == NULL || graph == NULL) {
+        free(manifest);
+        free(graph);
+        forge_util_set_error(error, error_size, "out of memory");
         return -1;
+    }
+    if (forge_manifest_load(manifest_path, manifest, error, error_size) != 0) {
+        goto done;
     }
     if (forge_build_project_root(manifest_path, root, sizeof(root)) != 0) {
-        return -1;
+        goto done;
     }
-    status = forge_deps_resolve(root, &manifest, 0, NULL, 0, 0, &graph, logger, error,
+    status = forge_deps_resolve(root, manifest, 0, NULL, 0, 0, graph, logger, error,
                                 error_size);
-    forge_deps_free_graph(&graph);
+    forge_deps_free_graph(graph);
+done:
+    free(manifest);
+    free(graph);
     return status;
 }
 
@@ -445,18 +458,24 @@ int forge_pkg_add(const char *manifest_path, const char *name,
                   const char *ref_value, const char *dep_path,
                   const char *registry_package, const char *registry_version,
                   const char *registry_min_version,
+                  const char *registry_features,
+                  int registry_no_default_features,
                   ForgeLogger *logger, char *error, size_t error_size)
 {
     static const char *const ref_kinds[] = { "tag", "branch", "rev" };
-    ForgeManifest manifest;
+    /* Heap, not stack: ForgeManifest is ~360KB and this frame nests the
+     * resolver (graph + another manifest + materialization frames). */
+    ForgeManifest *manifest = NULL;
     ForgeLineList lines = {0};
     ForgeLineList backup = {0};
     char *escaped_value = NULL;
     char *escaped_ref = NULL;
     char *escaped_second = NULL;
+    char *escaped_features = NULL;
     char *entry_line = NULL;
     char resolved_version[FORGE_MANIFEST_VALUE_MAX] = {0};
     char resolved_min[FORGE_MANIFEST_VALUE_MAX] = {0};
+    char joined_features[FORGE_FEATURES_JOINED_MAX] = {0};
     size_t needed;
     size_t index;
     int has_git = git_url != NULL && git_url[0] != '\0';
@@ -465,6 +484,7 @@ int forge_pkg_add(const char *manifest_path, const char *name,
     int has_ref = ref_value != NULL && ref_value[0] != '\0';
     int has_reg_version = registry_version != NULL && registry_version[0] != '\0';
     int has_reg_min = registry_min_version != NULL && registry_min_version[0] != '\0';
+    int has_reg_features = registry_features != NULL && registry_features[0] != '\0';
     const char *kind = ref_kind != NULL ? ref_kind : "";
 
     if (manifest_path == NULL || name == NULL) {
@@ -514,6 +534,28 @@ int forge_pkg_add(const char *manifest_path, const char *name,
                   "'%s': use only one of --version/--min-version", name);
         return -1;
     }
+    if ((has_reg_features || registry_no_default_features) && !has_registry) {
+        forge_util_set_error(error, error_size,
+                  "'%s': --features/--no-default-features only apply to registry dependencies", name);
+        return -1;
+    }
+    if (has_reg_features) {
+        ForgeDependency scratch;
+
+        memset(&scratch, 0, sizeof(scratch));
+        if (forge_parse_feature_list(name, registry_features, &scratch,
+                                     error, error_size) != 0) {
+            return -1;
+        }
+        if (forge_features_join(scratch.feature_count, scratch.features,
+                                joined_features,
+                                sizeof(joined_features)) != 0) {
+            forge_util_set_error(error, error_size,
+                      "'%s': feature set is too large", name);
+            return -1;
+        }
+        has_reg_features = joined_features[0] != '\0';
+    }
     if (has_registry && !dependency_name_is_portable(registry_package)) {
         forge_util_set_error(error, error_size,
                   "'%s' is not a valid registry package name; use letters, "
@@ -538,13 +580,20 @@ int forge_pkg_add(const char *manifest_path, const char *name,
     }
     /* Never edit a manifest forge cannot parse: typos elsewhere in the file
      * would be silently destroyed by the rewrite. */
-    if (forge_manifest_load(manifest_path, &manifest, error, error_size) != 0) {
+    manifest = calloc(1U, sizeof(*manifest));
+    if (manifest == NULL) {
+        forge_util_set_error(error, error_size, "out of memory");
         return -1;
     }
-    for (index = 0U; index < manifest.dependencies.count; ++index) {
-        if (strcmp(manifest.dependencies.items[index].name, name) == 0) {
+    if (forge_manifest_load(manifest_path, manifest, error, error_size) != 0) {
+        free(manifest);
+        return -1;
+    }
+    for (index = 0U; index < manifest->dependencies.count; ++index) {
+        if (strcmp(manifest->dependencies.items[index].name, name) == 0) {
             forge_util_set_error(error, error_size,
                       "dependency '%s' already exists in %s", name, manifest_path);
+            free(manifest);
             return -1;
         }
     }
@@ -583,34 +632,51 @@ int forge_pkg_add(const char *manifest_path, const char *name,
     } else if (has_reg_min) {
         escaped_second = escape_manifest_string(resolved_min);
     }
+    if (has_reg_features) {
+        escaped_features = escape_manifest_string(joined_features);
+    }
     if (escaped_value == NULL ||
         ((has_reg_version || has_reg_min) && escaped_second == NULL) ||
+        (has_reg_features && escaped_features == NULL) ||
         (has_ref && escaped_ref == NULL)) {
         forge_util_set_error(error, error_size, "out of memory");
         goto fail_before_write;
     }
+    /* Optional registry segments, built first so the entry line can be
+     * sized exactly: an exact/minimum pin, a feature request, and the
+     * defaults opt-out compose freely. */
+    char version_segment[FORGE_MANIFEST_VALUE_MAX + 32U] = {0};
+    char features_segment[FORGE_FEATURES_JOINED_MAX + 32U] = {0};
+    char defaults_segment[32] = {0};
+
+    if (has_reg_version) {
+        (void)snprintf(version_segment, sizeof(version_segment),
+                       ", version = \"%s\"", escaped_second);
+    } else if (has_reg_min) {
+        (void)snprintf(version_segment, sizeof(version_segment),
+                       ", min-version = \"%s\"", escaped_second);
+    }
+    if (has_reg_features) {
+        (void)snprintf(features_segment, sizeof(features_segment),
+                       ", features = \"%s\"", escaped_features);
+    }
+    if (registry_no_default_features) {
+        (void)snprintf(defaults_segment, sizeof(defaults_segment),
+                       "%s", ", default-features = \"false\"");
+    }
     needed = strlen(name) + strlen(escaped_value) + 48U +
              (has_ref ? strlen(kind) + strlen(escaped_ref) + 8U : 0U) +
-             ((has_reg_version || has_reg_min) ? strlen(escaped_second) + 32U : 0U);
+             strlen(version_segment) + strlen(features_segment) +
+             strlen(defaults_segment);
     entry_line = malloc(needed);
     if (entry_line == NULL) {
         forge_util_set_error(error, error_size, "out of memory");
         goto fail_before_write;
     }
     if (has_registry) {
-        if (has_reg_version) {
-            (void)snprintf(entry_line, needed,
-                           "%s = { registry = \"%s\", version = \"%s\" }",
-                           name, escaped_value, escaped_second);
-        } else if (has_reg_min) {
-            (void)snprintf(entry_line, needed,
-                           "%s = { registry = \"%s\", min-version = \"%s\" }",
-                           name, escaped_value, escaped_second);
-        } else {
-            (void)snprintf(entry_line, needed,
-                           "%s = { registry = \"%s\" }",
-                           name, escaped_value);
-        }
+        (void)snprintf(entry_line, needed, "%s = { registry = \"%s\"%s%s%s }",
+                       name, escaped_value, version_segment,
+                       features_segment, defaults_segment);
     } else if (has_git) {
         if (has_ref) {
             (void)snprintf(entry_line, needed, "%s = { git = \"%s\", %s = \"%s\" }",
@@ -663,20 +729,24 @@ int forge_pkg_add(const char *manifest_path, const char *name,
     }
     printf("forge: resolved %s and updated Forge.lock\n", name);
 
+    free(manifest);
     free(entry_line);
     free(escaped_value);
     free(escaped_ref);
     free(escaped_second);
+    free(escaped_features);
     line_list_free(&lines);
     line_list_free(&backup);
     return 0;
 
 fail_after_write:
 fail_before_write:
+    free(manifest);
     free(entry_line);
     free(escaped_value);
     free(escaped_ref);
     free(escaped_second);
+    free(escaped_features);
     line_list_free(&lines);
     line_list_free(&backup);
     return -1;
@@ -685,29 +755,36 @@ fail_before_write:
 int forge_pkg_remove(const char *manifest_path, const char *name,
                      ForgeLogger *logger, char *error, size_t error_size)
 {
-    ForgeManifest manifest;
+    /* Heap, not stack: ForgeManifest is ~360KB (see forge_pkg_add). */
+    ForgeManifest *manifest = NULL;
     ForgeLineList lines = {0};
     char available[FORGE_COMMAND_MAX];
     size_t index;
     size_t used = 0U;
+    int status = -1;
 
     if (manifest_path == NULL || name == NULL) {
         forge_util_set_error(error, error_size, "manifest path and dependency name are required");
         return -1;
     }
-    if (forge_manifest_load(manifest_path, &manifest, error, error_size) != 0) {
+    manifest = calloc(1U, sizeof(*manifest));
+    if (manifest == NULL) {
+        forge_util_set_error(error, error_size, "out of memory");
         return -1;
     }
-    for (index = 0U; index < manifest.dependencies.count; ++index) {
-        if (strcmp(manifest.dependencies.items[index].name, name) == 0) {
+    if (forge_manifest_load(manifest_path, manifest, error, error_size) != 0) {
+        goto done;
+    }
+    for (index = 0U; index < manifest->dependencies.count; ++index) {
+        if (strcmp(manifest->dependencies.items[index].name, name) == 0) {
             break;
         }
     }
-    if (index == manifest.dependencies.count) {
-        for (index = 0U; index < manifest.dependencies.count; ++index) {
+    if (index == manifest->dependencies.count) {
+        for (index = 0U; index < manifest->dependencies.count; ++index) {
             int written = snprintf(available + used, sizeof(available) - used,
                                    "%s%s", index != 0U ? ", " : "",
-                                   manifest.dependencies.items[index].name);
+                                   manifest->dependencies.items[index].name);
 
             if (written < 0 || (size_t)written >= sizeof(available) - used) {
                 break;
@@ -717,30 +794,33 @@ int forge_pkg_remove(const char *manifest_path, const char *name,
         forge_util_set_error(error, error_size,
                   "dependency '%s' is not declared in %s (declared: %s)",
                   name, manifest_path,
-                  manifest.dependencies.count == 0U ? "none" : available);
-        return -1;
+                  manifest->dependencies.count == 0U ? "none" : available);
+        goto done;
     }
     if (read_lines(manifest_path, &lines, error, error_size) != 0) {
-        return -1;
+        goto done;
     }
     if (!remove_dependency_line(&lines, name)) {
         forge_util_set_error(error, error_size,
                   "dependency '%s' is parsed but its line was not found in %s; "
                   "fix the file by hand", name, manifest_path);
         line_list_free(&lines);
-        return -1;
+        goto done;
     }
     if (write_lines(manifest_path, &lines, error, error_size) != 0) {
         line_list_free(&lines);
-        return -1;
+        goto done;
     }
     line_list_free(&lines);
     printf("forge: removed %s from %s\n", name, manifest_path);
 
     /* Dropping the pin from Forge.lock happens through the normal resolver. */
     if (resolve_after_edit(manifest_path, logger, error, error_size) != 0) {
-        return -1;
+        goto done;
     }
     printf("forge: updated Forge.lock\n");
-    return 0;
+    status = 0;
+done:
+    free(manifest);
+    return status;
 }

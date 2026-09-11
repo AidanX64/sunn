@@ -29,6 +29,13 @@
 #       builds refuse stale pins loudly and record revision in Forge.lock.
 #   R12 pre-revision lockfiles (no revision key) resolve byte-identically
 #       and pass --locked.
+#   R13 optional features: default features build, opting out rebuilds
+#       without them, unknown features fail with a rollback, and --locked
+#       guards the recorded set.
+#   R14 feature diamonds: same effective set dedupes, divergent sets
+#       conflict loudly.
+#   R15 feature dependencies: enabled features pull transitive registry
+#       deps; disabled ones leave no trace.
 #
 # The stub registry is generated in a temp dir (fixture sources, tarballs,
 # real sha256, index JSON) so the suite is hermetic: no network except
@@ -145,9 +152,17 @@ EOF
 #include "$name.h"
 int ${name}_value(void) { return $retval; }
 EOF
+    # Feature-gated sources (R13+): $FEATURE_C_SRC replaces the body above,
+    # and $FEATURES_JSON replaces the default empty features blob below.
+    if [ -n "${FEATURE_C_SRC:-}" ]; then
+        printf '%s\n' "$FEATURE_C_SRC" >"$src/src/$name.c"
+    fi
     tar -czf "$out/$name-$version.tar.gz" -C "$src" Forge.toml include src
     local sha
     sha="$(sha256_of "$out/$name-$version.tar.gz")"
+    # NB: the inner quotes below are backslash-escaped so they survive the
+    # expansion (unescaped quotes in a :- default are syntactic and get
+    # quote-removed, which used to emit bare keys and invalid JSON).
     cat >"$out/$version.json" <<EOF
 {
   "name": "$name",
@@ -161,6 +176,7 @@ EOF
   "dependencies": [],
   "source": {"kind": "url", "location": "/packages/$name/$name-$version.tar.gz", "sha256": "$sha"},
   "patches": [],
+  ${FEATURES_JSON:-\"features\": [], \"default-features\": []},
   "forge": {"manifest": "/packages/$name/Forge.toml"}
 }
 EOF
@@ -517,6 +533,109 @@ cmp -s "$work/c12/Forge.lock" "$work/c12/Forge.lock.orig" \
 (cd "$work/c12" && "$FORGE" build --locked >/dev/null 2>&1) \
     || fail "R12: --locked should pass once the pin is current"
 pass "R12 old lockfiles keep working"
+
+# --- R13: features ------------------------------------------------------
+# featlib's "fast" feature (default on) injects -DFAST_MODE=1, flipping the
+# return value; the lock records the effective set, --locked guards it.
+FEATURE_C_SRC='#include "featlib.h"
+#ifdef FAST_MODE
+int featlib_value(void) { return 42; }
+#else
+int featlib_value(void) { return 7; }
+#endif
+' FEATURES_JSON='"features": [{"name": "fast", "description": "fast path", "cflags": ["-DFAST_MODE=1"], "dependencies": []}, {"name": "slow", "description": "slow path", "cflags": ["-DSLOW_MODE=1"], "dependencies": []}], "default-features": ["fast"]' \
+    make_registry_pkg featlib 1.0.0 0 >/dev/null
+make_consumer "$work/c13" '#include <stdio.h>
+#include "featlib.h"
+int main(void) { return featlib_value(); }'
+(cd "$work/c13" && "$FORGE" add fast --registry featlib --version 1.0.0 >/dev/null 2>&1) \
+    || fail "R13: featured add failed"
+(cd "$work/c13" && "$FORGE" run >/dev/null 2>&1); code=$?
+[ "$code" -eq 42 ] || fail "R13: default feature off? exit $code, want 42"
+grep -q 'features = "fast"' "$work/c13/Forge.lock" \
+    || fail "R13: lock does not record the effective set"
+# Opt out of defaults: the slow path builds instead, in its own cache dir.
+make_consumer "$work/c13b" '#include <stdio.h>
+#include "featlib.h"
+int main(void) { return featlib_value(); }'
+(cd "$work/c13b" && "$FORGE" add slow --registry featlib --version 1.0.0 --no-default-features >/dev/null 2>&1) \
+    || fail "R13: no-default-features add failed"
+(cd "$work/c13b" && "$FORGE" run >/dev/null 2>&1); code=$?
+[ "$code" -eq 7 ] || fail "R13: defaults still on? exit $code, want 7"
+grep -q 'features = ""' "$work/c13b/Forge.lock" \
+    || fail "R13: lock should record an empty set"
+# Unknown features fail with a rollback.
+make_consumer "$work/c13c" 'int main(void) { return 0; }'
+if (cd "$work/c13c" && "$FORGE" add bad --registry featlib --version 1.0.0 --features bogus >/dev/null 2>&1); then
+    fail "R13: unknown feature should fail add"
+fi
+(cd "$work/c13c" && "$FORGE" add bad --registry featlib --version 1.0.0 --features bogus 2>&1 | grep -qi "unknown feature") \
+    || fail "R13: unknown-feature error is unclear"
+grep -q "bad = " "$work/c13c/Forge.toml" && fail "R13: failed add left a manifest entry"
+# --locked refuses a feature change.
+(cd "$work/c13" && "$FORGE" build --locked >/dev/null 2>&1) \
+    || fail "R13 setup: locked build should pass when current"
+replace_in_file 's/{ registry = "featlib", version = "1.0.0" }/{ registry = "featlib", version = "1.0.0", default-features = "false" }/' "$work/c13/Forge.toml"
+if (cd "$work/c13" && "$FORGE" build --locked >/dev/null 2>&1); then
+    fail "R13: --locked should refuse a feature change"
+fi
+pass "R13 features"
+
+# --- R14: feature diamonds ----------------------------------------------
+# Same effective set across a diamond (bare vs explicit defaults) dedupes;
+# divergent sets conflict loudly instead of silently building one of them.
+EXTRA_DEPS='feat = { registry = "featlib", version = "1.0.0" }' make_registry_pkg mid_bare 0.1.0 7 >/dev/null
+EXTRA_DEPS='feat = { registry = "featlib", version = "1.0.0", features = "fast" }' make_registry_pkg mid_fast 0.1.0 7 >/dev/null
+make_consumer "$work/c14" 'int main(void) { return 0; }'
+(cd "$work/c14" && "$FORGE" add via_bare --registry mid_bare --version 0.1.0 >/dev/null 2>&1) \
+    || fail "R14 setup: mid_bare add failed"
+(cd "$work/c14" && "$FORGE" add via_fast --registry mid_fast --version 0.1.0 >/dev/null 2>&1) \
+    || fail "R14: agreeing feature sets should dedupe, not conflict"
+(cd "$work/c14" && "$FORGE" check >/dev/null 2>&1) \
+    || fail "R14: agreeing diamond should check cleanly"
+EXTRA_DEPS='feat = { registry = "featlib", version = "1.0.0", features = "slow" }' make_registry_pkg mid_slow 0.1.0 7 >/dev/null
+make_consumer "$work/c14b" 'int main(void) { return 0; }'
+(cd "$work/c14b" && "$FORGE" add via_bare --registry mid_bare --version 0.1.0 >/dev/null 2>&1) \
+    || fail "R14 setup: mid_bare add failed"
+if (cd "$work/c14b" && "$FORGE" add via_slow --registry mid_slow --version 0.1.0 >/dev/null 2>&1); then
+    fail "R14: divergent feature sets should conflict"
+fi
+grep -q "via_slow = " "$work/c14b/Forge.toml" && fail "R14: conflicting add left a manifest entry"
+(cd "$work/c14b" && "$FORGE" add via_slow --registry mid_slow --version 0.1.0 2>&1 | grep -qi "conflict") \
+    || fail "R14: feature conflict does not say conflict"
+pass "R14 feature diamonds"
+
+# --- R15: feature dependencies ------------------------------------------
+# featlib2's "extra" feature pulls featdep transitively; without it the
+# dep is absent from the graph entirely.
+make_registry_pkg featdep 1.0.0 3 >/dev/null
+FEATURE_C_SRC='#include "featlib2.h"
+#ifdef HAVE_EXTRA
+#include "featdep.h"
+int featlib2_value(void) { return featdep_value() + 100; }
+#else
+int featlib2_value(void) { return 5; }
+#endif
+' FEATURES_JSON='"features": [{"name": "extra", "description": "extra dep", "cflags": ["-DHAVE_EXTRA=1"], "dependencies": [{"registry": "featdep", "version": "1.0.0"}]}], "default-features": []' \
+    make_registry_pkg featlib2 1.0.0 0 >/dev/null
+make_consumer "$work/c15" '#include <stdio.h>
+#include "featlib2.h"
+int main(void) { return featlib2_value(); }'
+(cd "$work/c15" && "$FORGE" add with_extra --registry featlib2 --version 1.0.0 --features extra >/dev/null 2>&1) \
+    || fail "R15: featured add failed"
+(cd "$work/c15" && "$FORGE" run >/dev/null 2>&1); code=$?
+[ "$code" -eq 103 ] || fail "R15: feature dep not linked? exit $code, want 103"
+grep -q "featdep = " "$work/c15/Forge.lock" \
+    || fail "R15: lock is missing the transitive feature dep"
+make_consumer "$work/c15b" '#include <stdio.h>
+#include "featlib2.h"
+int main(void) { return featlib2_value(); }'
+(cd "$work/c15b" && "$FORGE" add plain --registry featlib2 --version 1.0.0 >/dev/null 2>&1) \
+    || fail "R15: plain add failed"
+(cd "$work/c15b" && "$FORGE" run >/dev/null 2>&1); code=$?
+[ "$code" -eq 5 ] || fail "R15: feature leaked into a plain build? exit $code, want 5"
+grep -q "featdep = " "$work/c15b/Forge.lock" && fail "R15: plain lock should not list the feature dep"
+pass "R15 feature dependencies"
 
 # --- R9: http loopback (needs python3) ----------------------------------
 if command -v python3 >/dev/null 2>&1; then

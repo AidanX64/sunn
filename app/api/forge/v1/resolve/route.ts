@@ -57,6 +57,8 @@ export async function GET(request: Request) {
       revision: pkg.revision,
       source: pkg.source,
       patches: pkg.patches,
+      features: pkg.features,
+      "default-features": pkg["default-features"],
     })
   } catch (error) {
     console.error("Error resolving forge package:", error)

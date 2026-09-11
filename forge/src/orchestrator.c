@@ -934,7 +934,9 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
     ForgeCompiler compiler;
     ForgeSourceList sources = {0};
     int owns_sources = 0;
-    ForgeDepGraph dep_graph = {0};
+    /* Heap, not stack: ForgeDepGraph is ~640KB and this frame nests the
+     * resolver (another manifest + materialization frames). */
+    ForgeDepGraph *dep_graph = NULL;
     ForgeStringList dep_includes = {0};
     ForgePathList dep_link_inputs = {0};
     int have_deps = 0;
@@ -970,6 +972,13 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
     double started = forge_log_monotonic_seconds();
     int release;
     int max_jobs;
+
+    dep_graph = calloc(1U, sizeof(*dep_graph));
+    if (dep_graph == NULL) {
+        (void)snprintf(error, sizeof(error), "out of memory");
+        result = -1;
+        goto cleanup;
+    }
 
     if (options == NULL) {
         /* Defensive default so internal callers never need to synthesize one */
@@ -1014,20 +1023,20 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
     if (resolve_dependencies && manifest->dependencies.count > 0U) {
         if (forge_deps_resolve(project_root, manifest, 0, NULL,
                                options->offline, options->locked,
-                               &dep_graph, active_logger,
+                               dep_graph, active_logger,
                                error, sizeof(error)) != 0) {
             print_error("%s", error);
             goto cleanup;
         }
         have_deps = 1;
-        if (forge_deps_include_dirs(&dep_graph, &dep_includes, error,
+        if (forge_deps_include_dirs(dep_graph, &dep_includes, error,
                                     sizeof(error)) != 0) {
             print_error("%s", error);
             goto cleanup;
         }
         if (mode != FORGE_BUILD_MODE_COMPILE_ONLY) {
-            for (node_index = 0U; node_index < dep_graph.count; ++node_index) {
-                ForgeDepNode *node = &dep_graph.nodes[node_index];
+            for (node_index = 0U; node_index < dep_graph->count; ++node_index) {
+                ForgeDepNode *node = &dep_graph->nodes[node_index];
                 char suffix[FORGE_MANIFEST_VALUE_MAX + 8U];
 
                 version_suffix(node->manifest, suffix, sizeof(suffix));
@@ -1042,7 +1051,7 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
                     const ForgeStringList *forced_includes = NULL;
 
                     if (node->manifest->dependencies.count != 0U) {
-                        if (collect_dep_include_dirs(&dep_graph, node->manifest,
+                        if (collect_dep_include_dirs(dep_graph, node->manifest,
                                                      &node_includes, error,
                                                      sizeof(error)) != 0) {
                             print_error("%s", error);
@@ -1256,8 +1265,8 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
      * languages are unknowable here; raw cflags remain the escape hatch.
      */
     if (!has_cpp_source && have_deps) {
-        for (node_index = 0U; node_index < dep_graph.count; ++node_index) {
-            const ForgeDepNode *node = &dep_graph.nodes[node_index];
+        for (node_index = 0U; node_index < dep_graph->count; ++node_index) {
+            const ForgeDepNode *node = &dep_graph->nodes[node_index];
 
             if (node->manifest != NULL &&
                 node->manifest->cpp_source_dirs.count > 0U) {
@@ -1317,8 +1326,8 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
     /* Dependency objects/libraries resolve the project's symbols, so they
      * are collected in reverse build order (dependents first). */
     if (have_deps) {
-        for (node_index = dep_graph.count; node_index-- > 0U;) {
-            const ForgeDepNode *node = &dep_graph.nodes[node_index];
+        for (node_index = dep_graph->count; node_index-- > 0U;) {
+            const ForgeDepNode *node = &dep_graph->nodes[node_index];
 
             if (node->is_native) {
                 if (read_path_list(node->link_artifact, &dep_link_inputs) != 0) {
@@ -1483,7 +1492,8 @@ cleanup:
         forge_sources_free(&sources);
     }
     path_list_free(&dep_link_inputs);
-    forge_deps_free_graph(&dep_graph);
+    forge_deps_free_graph(dep_graph);
+    free(dep_graph);
     return result;
 }
 

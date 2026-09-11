@@ -289,6 +289,36 @@ static int dependency_name_is_valid(const char *name)
 }
 
 /*
+ * Feature names travel in cache directory suffixes, lock pins, and identity
+ * strings: letters, digits, '-' and '_' only (no dots, which would collide
+ * with the [features.name] reading), 1-32 characters.
+ */
+int forge_feature_name_is_valid(const char *name)
+{
+    size_t length;
+    size_t index;
+
+    if (name == NULL) {
+        return 0;
+    }
+    length = strlen(name);
+    if (length == 0U || length > FORGE_FEATURE_NAME_MAX) {
+        return 0;
+    }
+    for (index = 0U; index < length; ++index) {
+        unsigned char character = (unsigned char)name[index];
+
+        if (!((character >= 'a' && character <= 'z') ||
+              (character >= 'A' && character <= 'Z') ||
+              (character >= '0' && character <= '9') ||
+              character == '-' || character == '_')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/*
  * Versions follow the semver core shape: three numeric components without
  * leading zeros, optionally followed by a '-' pre-release of alphanumeric,
  * hyphen, or dot characters ("1.2.3", "1.2.3-rc.1"). Strictness here means
@@ -594,6 +624,106 @@ static const ForgeInlineEntry *find_inline_entry(const ForgeInlineEntry *entries
     return NULL;
 }
 
+/*
+ * Splits a comma-separated feature list ("ssl, http") into dependency
+ * slots. Inline tables only carry quoted strings, so features spell as one
+ * string rather than an array; every name is validated here so typos fail
+ * at parse time (existence is checked against the recipe after fetch).
+ * The stored list is sorted and deduplicated so cache directories, lock
+ * pins, and identity strings are stable however the manifest spells it.
+ */
+int forge_parse_feature_list(const char *name, const char *text,
+                             ForgeDependency *dependency,
+                             char *error, size_t error_size)
+{
+    const char *cursor = text;
+    size_t left;
+    size_t slot;
+
+    for (;;) {
+        const char *item;
+        size_t length;
+        char candidate[FORGE_FEATURE_NAME_MAX + 1U];
+
+        while (*cursor == ' ' || *cursor == '\t') {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        item = cursor;
+        while (*cursor != '\0' && *cursor != ',') {
+            ++cursor;
+        }
+        length = (size_t)(cursor - item);
+        while (length != 0U &&
+               (item[length - 1U] == ' ' || item[length - 1U] == '\t')) {
+            --length;
+        }
+        if (length > FORGE_FEATURE_NAME_MAX) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': bad feature name; use 1-%u of "
+                      "letters, digits, '-', '_'",
+                      name, (unsigned int)FORGE_FEATURE_NAME_MAX);
+            return -1;
+        }
+        memcpy(candidate, item, length);
+        candidate[length] = '\0';
+        if (!forge_feature_name_is_valid(candidate)) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': bad feature name '%s'; use letters, "
+                      "digits, '-', '_'",
+                      name, candidate);
+            return -1;
+        }
+        if (dependency->feature_count == FORGE_DEP_FEATURES_MAX) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': more than %u features",
+                      name, (unsigned int)FORGE_DEP_FEATURES_MAX);
+            return -1;
+        }
+        memcpy(dependency->features[dependency->feature_count], item, length);
+        dependency->features[dependency->feature_count][length] = '\0';
+        ++dependency->feature_count;
+        if (*cursor == '\0') {
+            break;
+        }
+        ++cursor; /* skip ',' */
+    }
+    /* Insertion sort plus dedupe into canonical order (memmove: the
+     * slots overlap by construction, which snprintf forbids). */
+    for (slot = 1U; slot < dependency->feature_count; ++slot) {
+        char held[FORGE_FEATURE_NAME_MAX + 1U];
+        size_t held_at = slot;
+
+        memcpy(held, dependency->features[slot], sizeof(held));
+        while (held_at > 0U &&
+               strcmp(dependency->features[held_at - 1U], held) > 0) {
+            memmove(dependency->features[held_at],
+                    dependency->features[held_at - 1U],
+                    sizeof(dependency->features[held_at]));
+            --held_at;
+        }
+        memcpy(dependency->features[held_at], held, sizeof(held));
+    }
+    left = 0U;
+    for (slot = 0U; slot < dependency->feature_count; ++slot) {
+        if (left != 0U &&
+            strcmp(dependency->features[slot],
+                   dependency->features[left - 1U]) == 0) {
+            continue;
+        }
+        if (slot != left) {
+            memmove(dependency->features[left],
+                    dependency->features[slot],
+                    sizeof(dependency->features[left]));
+        }
+        ++left;
+    }
+    dependency->feature_count = left;
+    return 0;
+}
+
 static int parse_dependency_assignment(ForgeDependencyList *list, const char *name,
                                        char *value, char *error, size_t error_size)
 {
@@ -640,6 +770,10 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
             find_inline_entry(entries, count, "version");
         const ForgeInlineEntry *min_version_entry =
             find_inline_entry(entries, count, "min-version");
+        const ForgeInlineEntry *features_entry =
+            find_inline_entry(entries, count, "features");
+        const ForgeInlineEntry *default_features_entry =
+            find_inline_entry(entries, count, "default-features");
         int source_count = (entry != NULL) + (git_entry != NULL) +
                            (registry_entry != NULL);
 
@@ -665,6 +799,13 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
             forge_util_set_error(error, error_size,
                       "dependency '%s': use only one of version (exact pin) "
                       "or min-version (minimum)", name);
+            return -1;
+        }
+        if ((features_entry != NULL || default_features_entry != NULL) &&
+            registry_entry == NULL) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': features only apply to registry "
+                      "dependencies", name);
             return -1;
         }
         if (registry_entry != NULL) {
@@ -703,6 +844,8 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
     dependency->registry[0] = '\0';
     dependency->registry_version[0] = '\0';
     dependency->registry_min_version[0] = '\0';
+    dependency->feature_count = 0U;
+    dependency->default_features = 1;
     if (entry != NULL) {
         if (find_inline_entry(entries, count, "tag") != NULL ||
             find_inline_entry(entries, count, "branch") != NULL ||
@@ -784,17 +927,45 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
                                min_entry->value);
             }
         }
+        {
+            const ForgeInlineEntry *features_entry =
+                find_inline_entry(entries, count, "features");
+            const ForgeInlineEntry *defaults_entry =
+                find_inline_entry(entries, count, "default-features");
+
+            if (features_entry != NULL &&
+                forge_parse_feature_list(name, features_entry->value, dependency,
+                                   error, error_size) != 0) {
+                return -1;
+            }
+            if (defaults_entry != NULL) {
+                char flag_value[FORGE_MANIFEST_VALUE_MAX];
+
+                /* parse_boolean trims in place, so it needs a writable copy. */
+                (void)snprintf(flag_value, sizeof(flag_value), "%s",
+                               defaults_entry->value);
+                if (parse_boolean(flag_value, &dependency->default_features,
+                                  error, error_size) != 0) {
+                    forge_util_set_error(error, error_size,
+                              "dependency '%s': default-features must be "
+                              "\"true\" or \"false\"",
+                              name);
+                    return -1;
+                }
+            }
+        }
     }
     /* Reject unknown keys so typos fail loudly. */
     for (index = 0U; index < count; ++index) {
         static const char *const allowed[] = {
             "path", "git", "tag", "branch", "rev", "submodules",
-            "registry", "version", "min-version"
+            "registry", "version", "min-version", "features",
+            "default-features"
         };
         size_t allowed_index;
         int known = 0;
 
-        for (allowed_index = 0U; allowed_index < 9U; ++allowed_index) {
+        for (allowed_index = 0U; allowed_index < 11U; ++allowed_index) {
             if (strcmp(entries[index].key, allowed[allowed_index]) == 0) {
                 known = 1;
                 break;

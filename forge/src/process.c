@@ -283,8 +283,9 @@ static int resolve_executable(const char *program, char *resolved,
     return -1;
 }
 
-int forge_process_run(char *const *argv, const char *redirect_to,
-                      int appending, int *exit_code, char *error, size_t error_size)
+int forge_process_run_at(const char *work_dir, char *const *argv,
+                         const char *redirect_to, int appending,
+                         int *exit_code, char *error, size_t error_size)
 {
     char *command_line;
     char executable[FORGE_PROCESS_PATH_MAX];
@@ -304,8 +305,14 @@ int forge_process_run(char *const *argv, const char *redirect_to,
         return -1;
     }
     if (redirect_to != NULL) {
+        LARGE_INTEGER end = { { 0 } };
+
+        /* GENERIC_WRITE (not FILE_APPEND_DATA): MSYS/Cygwin children cannot
+         * write to append-only handles, so they silently lose all output.
+         * Append mode is recovered by seeking to the end before spawning;
+         * the child inherits the offset. */
         redirected = CreateFileA(redirect_to,
-                                 FILE_APPEND_DATA,
+                                 GENERIC_WRITE,
                                  FILE_SHARE_READ | FILE_SHARE_WRITE,
                                  NULL, appending ? OPEN_ALWAYS : CREATE_ALWAYS,
                                  FILE_ATTRIBUTE_NORMAL, NULL);
@@ -314,6 +321,15 @@ int forge_process_run(char *const *argv, const char *redirect_to,
                 (void)snprintf(error, error_size, "could not open '%s' for output (error %lu)",
                                redirect_to, (unsigned long)GetLastError());
             }
+            return -1;
+        }
+        if (appending && SetFilePointerEx(redirected, end, NULL,
+                                          FILE_END) == 0) {
+            if (error != NULL && error_size != 0U) {
+                (void)snprintf(error, error_size, "could not seek '%s' (error %lu)",
+                               redirect_to, (unsigned long)GetLastError());
+            }
+            (void)CloseHandle(redirected);
             return -1;
         }
         (void)SetHandleInformation(redirected, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
@@ -333,7 +349,7 @@ int forge_process_run(char *const *argv, const char *redirect_to,
     startup.hStdError = redirected != NULL ? redirected : GetStdHandle(STD_ERROR_HANDLE);
 
     if (CreateProcessA(executable, command_line, NULL, NULL, TRUE, 0, NULL,
-                       NULL, &startup, &process) == 0) {
+                       work_dir, &startup, &process) == 0) {
         if (error != NULL && error_size != 0U) {
             (void)snprintf(error, error_size,
                            "could not start '%s' (error %lu)", argv[0],
@@ -358,6 +374,13 @@ int forge_process_run(char *const *argv, const char *redirect_to,
     }
     return 0;
 }
+
+int forge_process_run(char *const *argv, const char *redirect_to,
+                      int appending, int *exit_code, char *error, size_t error_size)
+{
+    return forge_process_run_at(NULL, argv, redirect_to, appending,
+                                exit_code, error, error_size);
+}
 #else
 #include <errno.h>
 #include <fcntl.h>
@@ -365,8 +388,9 @@ int forge_process_run(char *const *argv, const char *redirect_to,
 #include <sys/wait.h>
 #include <unistd.h>
 
-int forge_process_run(char *const *argv, const char *redirect_to,
-                      int appending, int *exit_code, char *error, size_t error_size)
+int forge_process_run_at(const char *work_dir, char *const *argv,
+                         const char *redirect_to, int appending,
+                         int *exit_code, char *error, size_t error_size)
 {
     pid_t child;
     int status = -1;
@@ -399,6 +423,9 @@ int forge_process_run(char *const *argv, const char *redirect_to,
         return -1;
     }
     if (child == 0) {
+        if (work_dir != NULL && chdir(work_dir) != 0) {
+            _exit(127);
+        }
         if (fd >= 0) {
             (void)dup2(fd, STDOUT_FILENO);
             (void)dup2(fd, STDERR_FILENO);
@@ -418,5 +445,12 @@ int forge_process_run(char *const *argv, const char *redirect_to,
         *exit_code = -1;
     }
     return 0;
+}
+
+int forge_process_run(char *const *argv, const char *redirect_to,
+                      int appending, int *exit_code, char *error, size_t error_size)
+{
+    return forge_process_run_at(NULL, argv, redirect_to, appending,
+                                exit_code, error, error_size);
 }
 #endif

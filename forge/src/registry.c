@@ -195,24 +195,57 @@ static int apply_registry_patches(ForgeLogger *logger, const char *base,
     return 0;
 }
 
+/*
+ * Cache directory discriminant for the declared feature request. A bare
+ * request with defaults on (the common, pre-feature layout) takes no
+ * suffix, preserving existing cache directories; otherwise "+" plus the
+ * canonical declared names, with "~nodefault" when defaults are off.
+ * Names are manifest-validated, so "+", "," and "~" are the only
+ * punctuation and all are path-safe on every host. The effective set
+ * (defaults resolved) lives in the lock pin instead: the same spelling
+ * always builds the same bytes per recipe, and recipe default changes
+ * move the pin rather than the directory.
+ */
+static int features_dir_suffix(const char *declared, int use_defaults,
+                               char *out, size_t out_size)
+{
+    if ((declared == NULL || declared[0] == '\0') && use_defaults) {
+        out[0] = '\0';
+        return 0;
+    }
+    if ((size_t)snprintf(out, out_size, "+%s%s",
+                         declared != NULL ? declared : "",
+                         use_defaults ? "" : "~nodefault") >= out_size) {
+        return -1;
+    }
+    return 0;
+}
+
 int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
                                const char *package,
                                const char *wanted_version,
                                const char *min_version,
+                               const char *declared_features,
+                               int use_defaults,
                                const char *lock_version, const char *lock_kind,
                                const char *lock_location, const char *lock_ref,
                                const char *lock_commit, const char *lock_sha256,
                                unsigned lock_revision,
+                               const char *lock_features,
                                int force_update, int offline,
                                const char *package_dir,
                                char *root_out, size_t root_size,
-                               ForgeRegistryPin *pin, int *reused,
+                               ForgeRegistryPin *pin, ForgeFeatureDefs *defs,
+                               int *reused,
                                char *error, size_t error_size)
 {
     char base[FORGE_PATH_MAX];
     char version[FORGE_MANIFEST_VALUE_MAX];
     char floor_version[FORGE_MANIFEST_VALUE_MAX];
     unsigned floor_revision = 0U;
+    /* Declared-spelling suffix buffer: 16 manifest names worst case, well
+     * above the effective set the lock records. */
+    char feature_suffix[1024];
     char safe[FORGE_PATH_MAX];
     char version_dir[FORGE_PATH_MAX];
     char resolve_tmp[FORGE_PATH_MAX];
@@ -221,8 +254,8 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
     int query_latest;
     int min_given = min_version != NULL && min_version[0] != '\0';
 
-    if (pin == NULL || reused == NULL) {
-        forge_util_set_error(error, error_size, "registry materialize needs a pin");
+    if (pin == NULL || reused == NULL || defs == NULL) {
+        forge_util_set_error(error, error_size, "registry materialize needs a pin, feature definitions, and reuse flag");
         return -1;
     }
     memset(pin, 0, sizeof(*pin));
@@ -231,6 +264,11 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
         !package_name_is_portable(package)) {
         forge_util_set_error(error, error_size, "invalid registry package name '%s'",
                              package != NULL ? package : "<null>");
+        return -1;
+    }
+    if (features_dir_suffix(declared_features, use_defaults,
+                            feature_suffix, sizeof(feature_suffix)) != 0) {
+        forge_util_set_error(error, error_size, "registry feature set is too long");
         return -1;
     }
     query_latest = 0;
@@ -276,28 +314,33 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
         }
     }
     if (version[0] != '\0') {
+        size_t suffix_length = strlen(feature_suffix);
+
         forge_paths_safe_output_name(version, safe, sizeof(safe));
         if (lock_kind != NULL && strcmp(lock_kind, "git") == 0 &&
             lock_location != NULL && lock_location[0] != '\0') {
             char cache_hash[32];
             registry_cache_hash(lock_location, cache_hash, sizeof(cache_hash));
-            if (strlen(package_dir) + strlen(safe) + strlen(cache_hash) + 2U >=
-                sizeof(version_dir)) {
+            if (strlen(package_dir) + strlen(safe) + strlen(cache_hash) + 2U +
+                suffix_length >= sizeof(version_dir)) {
                 forge_util_set_error(error, error_size, "registry cache path is too long");
                 return -1;
             }
             {
                 size_t base_length = strlen(package_dir);
                 size_t name_length = strlen(safe);
+                size_t hash_length = strlen(cache_hash);
                 memcpy(version_dir, package_dir, base_length);
                 version_dir[base_length] = '/';
                 memcpy(version_dir + base_length + 1U, safe, name_length);
                 version_dir[base_length + 1U + name_length] = '-';
                 memcpy(version_dir + base_length + 2U + name_length,
-                       cache_hash, strlen(cache_hash) + 1U);
+                       cache_hash, hash_length);
+                memcpy(version_dir + base_length + 2U + name_length + hash_length,
+                       feature_suffix, suffix_length + 1U);
             }
         } else {
-        if (strlen(package_dir) + strlen(safe) + 1U >= sizeof(version_dir)) {
+        if (strlen(package_dir) + strlen(safe) + 1U + suffix_length >= sizeof(version_dir)) {
             forge_util_set_error(error, error_size, "registry cache path is too long");
             return -1;
         }
@@ -306,7 +349,9 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
             size_t name_length = strlen(safe);
             memcpy(version_dir, package_dir, base_length);
             version_dir[base_length] = '/';
-            memcpy(version_dir + base_length + 1U, safe, name_length + 1U);
+            memcpy(version_dir + base_length + 1U, safe, name_length);
+            memcpy(version_dir + base_length + 1U + name_length,
+                   feature_suffix, suffix_length + 1U);
         }
         }
     } else {
@@ -328,13 +373,35 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
         recipe_read_marker(version_dir, marker, sizeof(marker));
         if (!force_update && strcmp(identity, marker) == 0 &&
             recipe_directory_has_source(version_dir)) {
-            (void)snprintf(pin->version, sizeof(pin->version), "%s", locked.version);
-            (void)snprintf(pin->kind, sizeof(pin->kind), "%s", locked.kind);
-            (void)snprintf(pin->location, sizeof(pin->location), "%s", locked.location);
-            (void)snprintf(pin->ref, sizeof(pin->ref), "%s", locked.ref);
-            (void)snprintf(pin->commit, sizeof(pin->commit), "%s", locked.commit);
-            (void)snprintf(pin->sha256, sizeof(pin->sha256), "%s", locked.sha256);
-            pin->revision = locked.revision;
+            /*
+             * Cache hit: the bytes stay, but downstream still needs the
+             * recipe's feature definitions (effective-set validation, cflag
+             * folding, feature dependencies). Re-read the exact locked
+             * recipe unless definitions cannot matter (no declared request
+             * and an empty recorded set) or cannot be reached (remote
+             * registry while --offline). A skipped refresh leaves defs
+             * empty and the caller falls back to the lock's recorded set.
+             */
+            int need_defs = (declared_features != NULL && declared_features[0] != '\0') ||
+                (lock_features != NULL && lock_features[0] != '\0');
+            int recipe_local = strncmp(base, "file://", 7U) == 0;
+
+            if (need_defs && lock_version != NULL && lock_version[0] != '\0' &&
+                (!offline || recipe_local)) {
+                if (forge_registry_query(logger, package, lock_version,
+                                         resolve_tmp, pin, defs, error,
+                                         error_size) != 0) {
+                    return -1;
+                }
+            } else {
+                (void)snprintf(pin->version, sizeof(pin->version), "%s", locked.version);
+                (void)snprintf(pin->kind, sizeof(pin->kind), "%s", locked.kind);
+                (void)snprintf(pin->location, sizeof(pin->location), "%s", locked.location);
+                (void)snprintf(pin->ref, sizeof(pin->ref), "%s", locked.ref);
+                (void)snprintf(pin->commit, sizeof(pin->commit), "%s", locked.commit);
+                (void)snprintf(pin->sha256, sizeof(pin->sha256), "%s", locked.sha256);
+                pin->revision = locked.revision;
+            }
             (void)snprintf(root_out, root_size, "%s", version_dir);
             *reused = 1;
             return 0;
@@ -346,7 +413,7 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
                   dep_name != NULL ? dep_name : package);
         return -1;
     }
-    if (forge_registry_query(logger, package, version, resolve_tmp, pin,
+    if (forge_registry_query(logger, package, version, resolve_tmp, pin, defs,
                              error, error_size) != 0) return -1;
     if (query_latest && floor_version[0] != '\0' &&
         (forge_version_compare(pin->version, floor_version) < 0 ||
@@ -1043,6 +1110,545 @@ static int parse_recipe(const char *body, const char *base,
 }
 
 /* ------------------------------------------------------------------ */
+/* Recipe features                                                     */
+/*                                                                     */
+/* Optional named build variants: extra compiler flags plus extra      */
+/* transitive (registry-only) dependencies. The consumer manifest only */
+/* selects; definitions ride the recipe JSON the query already holds.  */
+/* ------------------------------------------------------------------ */
+
+static int parse_feature_dep(const char *span, ForgeFeatureDef *def,
+                             char *error, size_t error_size)
+{
+    ForgeJsonCursor object;
+    char package[FORGE_MANIFEST_VALUE_MAX];
+    char version[FORGE_MANIFEST_VALUE_MAX] = { 0 };
+    char min_version[FORGE_MANIFEST_VALUE_MAX] = { 0 };
+    int is_null = 0;
+    int found;
+    ForgeFeatureDep *slot;
+
+    if (def->dep_count == FORGE_FEATURE_DEPS_MAX) {
+        forge_util_set_error(error, error_size,
+                  "recipe feature '%s' lists more than %u dependencies",
+                  def->name, (unsigned int)FORGE_FEATURE_DEPS_MAX);
+        return -1;
+    }
+    object.text = span;
+    object.error = NULL;
+    found = json_object_string(&object, "registry", package,
+                               sizeof(package), &is_null);
+    if (found <= 0 || is_null || !package_name_is_portable(package)) {
+        forge_util_set_error(error, error_size,
+                  "recipe feature '%s' has a dependency without a usable "
+                  "registry package", def->name);
+        return -1;
+    }
+    object.text = span;
+    object.error = NULL;
+    found = json_object_string(&object, "version", version,
+                               sizeof(version), &is_null);
+    if (found < 0 || (found > 0 && !is_null &&
+                      !version_text_is_valid(version))) {
+        forge_util_set_error(error, error_size,
+                  "recipe feature '%s' has a dependency without a usable "
+                  "version", def->name);
+        return -1;
+    }
+    object.text = span;
+    object.error = NULL;
+    found = json_object_string(&object, "min-version", min_version,
+                               sizeof(min_version), &is_null);
+    if (found < 0 || (found > 0 && !is_null &&
+                      !version_text_is_valid(min_version))) {
+        forge_util_set_error(error, error_size,
+                  "recipe feature '%s' has a dependency without a usable "
+                  "minimum version", def->name);
+        return -1;
+    }
+    if (version[0] != '\0' && min_version[0] != '\0') {
+        forge_util_set_error(error, error_size,
+                  "recipe feature '%s' dependency '%s' pins both version "
+                  "and min-version", def->name, package);
+        return -1;
+    }
+    slot = &def->deps[def->dep_count++];
+    (void)snprintf(slot->package, sizeof(slot->package), "%s", package);
+    (void)snprintf(slot->version, sizeof(slot->version), "%s", version);
+    (void)snprintf(slot->min_version, sizeof(slot->min_version), "%s",
+                   min_version);
+    return 0;
+}
+
+static int parse_feature(const char *span, ForgeFeatureDefs *defs,
+                         char *error, size_t error_size)
+{
+    ForgeJsonCursor object;
+    ForgeFeatureDef *def;
+    char flag_text[FORGE_FEATURE_CFLAG_MAX][FORGE_PATH_MAX];
+    size_t flag_count = 0U;
+    size_t index;
+    int is_null = 0;
+    int found;
+
+    if (defs->count == FORGE_RECIPE_FEATURES_MAX) {
+        forge_util_set_error(error, error_size,
+                  "recipe defines more than %u features",
+                  (unsigned int)FORGE_RECIPE_FEATURES_MAX);
+        return -1;
+    }
+    def = &defs->items[defs->count];
+    object.text = span;
+    object.error = NULL;
+    found = json_object_string(&object, "name", def->name,
+                               sizeof(def->name), &is_null);
+    if (found <= 0 || is_null || !forge_feature_name_is_valid(def->name)) {
+        forge_util_set_error(error, error_size,
+                  "recipe defines a feature without a usable name");
+        return -1;
+    }
+    for (index = 0U; index < defs->count; ++index) {
+        if (strcmp(defs->items[index].name, def->name) == 0) {
+            forge_util_set_error(error, error_size,
+                      "recipe defines feature '%s' twice", def->name);
+            return -1;
+        }
+    }
+    /* cflags: plain string array on the element span; over-capacity and
+     * non-string elements fail inside the helper. */
+    if (json_array_strings(span, "cflags", flag_text,
+                           FORGE_FEATURE_CFLAG_MAX, &flag_count) != 0) {
+        forge_util_set_error(error, error_size,
+                  "recipe feature '%s' has an invalid cflags array",
+                  def->name);
+        return -1;
+    }
+    for (index = 0U; index < flag_count; ++index) {
+        size_t flag_length = strlen(flag_text[index]);
+
+        if (flag_length >= FORGE_MANIFEST_VALUE_MAX) {
+            forge_util_set_error(error, error_size,
+                      "recipe feature '%s' has an overlong cflag",
+                      def->name);
+            return -1;
+        }
+        memcpy(def->cflags[index], flag_text[index], flag_length + 1U);
+    }
+    def->cflag_count = flag_count;
+    /* dependencies: optional array of registry-only {registry, version?,
+     * min-version?} tables; unknown keys ride along per house rules. */
+    {
+        ForgeJsonCursor scan = { span, NULL };
+        int first = 1;
+
+        json_skip_space(&scan);
+        if (*scan.text != '{') {
+            forge_util_set_error(error, error_size,
+                      "recipe feature '%s' is malformed", def->name);
+            return -1;
+        }
+        ++scan.text;
+        for (;;) {
+            char key[128];
+
+            json_skip_space(&scan);
+            if (*scan.text == '}') {
+                break;
+            }
+            if (!first) {
+                if (*scan.text != ',') {
+                    forge_util_set_error(error, error_size,
+                              "recipe feature '%s' is malformed", def->name);
+                    return -1;
+                }
+                ++scan.text;
+                json_skip_space(&scan);
+            }
+            first = 0;
+            if (json_read_string(&scan, key, sizeof(key)) != 0) {
+                forge_util_set_error(error, error_size,
+                          "recipe feature '%s' is malformed", def->name);
+                return -1;
+            }
+            json_skip_space(&scan);
+            if (*scan.text != ':') {
+                forge_util_set_error(error, error_size,
+                          "recipe feature '%s' is malformed", def->name);
+                return -1;
+            }
+            ++scan.text;
+            json_skip_space(&scan);
+            if (strcmp(key, "dependencies") != 0) {
+                if (json_skip_value(&scan) != 0) {
+                    forge_util_set_error(error, error_size,
+                              "recipe feature '%s' is malformed", def->name);
+                    return -1;
+                }
+                continue;
+            }
+            if (*scan.text != '[') {
+                forge_util_set_error(error, error_size,
+                          "recipe feature '%s' has dependencies that are "
+                          "not an array", def->name);
+                return -1;
+            }
+            ++scan.text;
+            for (;;) {
+                const char *dep_start;
+                char dep_span[2048];
+                size_t dep_length;
+
+                json_skip_space(&scan);
+                if (*scan.text == ']') {
+                    break;
+                }
+                if (*scan.text != '{') {
+                    forge_util_set_error(error, error_size,
+                              "recipe feature '%s' has a malformed "
+                              "dependency", def->name);
+                    return -1;
+                }
+                dep_start = scan.text;
+                if (json_skip_value(&scan) != 0) {
+                    forge_util_set_error(error, error_size,
+                              "recipe feature '%s' has a malformed "
+                              "dependency", def->name);
+                    return -1;
+                }
+                dep_length = (size_t)(scan.text - dep_start);
+                if (dep_length >= sizeof(dep_span)) {
+                    forge_util_set_error(error, error_size,
+                              "recipe feature '%s' has an oversized "
+                              "dependency", def->name);
+                    return -1;
+                }
+                memcpy(dep_span, dep_start, dep_length);
+                dep_span[dep_length] = '\0';
+                if (parse_feature_dep(dep_span, def, error, error_size) != 0) {
+                    return -1;
+                }
+                json_skip_space(&scan);
+                if (*scan.text == ',') {
+                    ++scan.text;
+                    continue;
+                }
+                if (*scan.text == ']') {
+                    break;
+                }
+                forge_util_set_error(error, error_size,
+                          "recipe feature '%s' has a malformed dependency "
+                          "list", def->name);
+                return -1;
+            }
+            break;
+        }
+    }
+    ++defs->count;
+    return 0;
+}
+
+/*
+ * Reads the recipe's feature definitions ("features" array plus the
+ * "default-features" names) into `defs`, zeroed first. Absent sections
+ * mean "no features". Malformed shapes, bad names, over-cap counts, bad
+ * versions, duplicate features/sections, or defaults naming undefined
+ * features fail loudly. Returns 0 on success.
+ */
+int forge_registry_parse_features(const char *body, ForgeFeatureDefs *defs,
+                                  char *error, size_t error_size)
+{
+    ForgeJsonCursor cursor = { body, NULL };
+    char defaults[FORGE_DEP_FEATURES_MAX][FORGE_PATH_MAX];
+    size_t default_count = 0U;
+    int found_features = 0;
+    int found_defaults = 0;
+    int first = 1;
+    size_t index;
+    size_t slot;
+
+    if (defs == NULL) {
+        forge_util_set_error(error, error_size, "feature definitions output is required");
+        return -1;
+    }
+    memset(defs, 0, sizeof(*defs));
+    json_skip_space(&cursor);
+    if (*cursor.text != '{') {
+        forge_util_set_error(error, error_size, "registry response is not valid JSON");
+        return -1;
+    }
+    ++cursor.text;
+    for (;;) {
+        char key[128];
+
+        json_skip_space(&cursor);
+        if (*cursor.text == '}') {
+            break;
+        }
+        if (!first) {
+            if (*cursor.text != ',') {
+                forge_util_set_error(error, error_size, "registry response is not valid JSON");
+                return -1;
+            }
+            ++cursor.text;
+            json_skip_space(&cursor);
+        }
+        first = 0;
+        if (json_read_string(&cursor, key, sizeof(key)) != 0) {
+            forge_util_set_error(error, error_size, "registry response is not valid JSON");
+            return -1;
+        }
+        json_skip_space(&cursor);
+        if (*cursor.text != ':') {
+            forge_util_set_error(error, error_size, "registry response is not valid JSON");
+            return -1;
+        }
+        ++cursor.text;
+        json_skip_space(&cursor);
+        if (strcmp(key, "features") == 0) {
+            const char *span_start;
+            char span[8192];
+            size_t span_length;
+
+            if (found_features) {
+                forge_util_set_error(error, error_size, "registry response repeats features");
+                return -1;
+            }
+            found_features = 1;
+            if (*cursor.text != '[') {
+                forge_util_set_error(error, error_size, "registry features are not an array");
+                return -1;
+            }
+            ++cursor.text;
+            for (;;) {
+                json_skip_space(&cursor);
+                if (*cursor.text == ']') {
+                    ++cursor.text;
+                    break;
+                }
+                if (*cursor.text != '{') {
+                    forge_util_set_error(error, error_size, "registry feature is malformed");
+                    return -1;
+                }
+                span_start = cursor.text;
+                if (json_skip_value(&cursor) != 0) {
+                    forge_util_set_error(error, error_size, "registry feature is malformed");
+                    return -1;
+                }
+                span_length = (size_t)(cursor.text - span_start);
+                if (span_length >= sizeof(span)) {
+                    forge_util_set_error(error, error_size, "registry feature is oversized");
+                    return -1;
+                }
+                memcpy(span, span_start, span_length);
+                span[span_length] = '\0';
+                if (parse_feature(span, defs, error, error_size) != 0) {
+                    return -1;
+                }
+                json_skip_space(&cursor);
+                if (*cursor.text == ',') {
+                    ++cursor.text;
+                    continue;
+                }
+                if (*cursor.text == ']') {
+                    /* Consume the closer like the empty-array exit above:
+                     * the outer object walk resumes after the array. */
+                    ++cursor.text;
+                    break;
+                }
+                forge_util_set_error(error, error_size, "registry feature list is malformed");
+                return -1;
+            }
+        } else if (strcmp(key, "default-features") == 0) {
+            if (found_defaults) {
+                forge_util_set_error(error, error_size, "registry response repeats default-features");
+                return -1;
+            }
+            found_defaults = 1;
+            if (json_array_strings(body, "default-features", defaults,
+                                   FORGE_DEP_FEATURES_MAX,
+                                   &default_count) != 0 ||
+                json_skip_value(&cursor) != 0) {
+                forge_util_set_error(error, error_size, "registry default-features are not a string array");
+                return -1;
+            }
+        } else {
+            if (json_skip_value(&cursor) != 0) {
+                forge_util_set_error(error, error_size, "registry response is not valid JSON");
+                return -1;
+            }
+        }
+    }
+    for (index = 0U; index < default_count; ++index) {
+        if (!forge_feature_name_is_valid(defaults[index])) {
+            forge_util_set_error(error, error_size,
+                      "registry default feature '%s' is not a usable name",
+                      defaults[index]);
+            return -1;
+        }
+        for (slot = 0U; slot < defs->count; ++slot) {
+            if (strcmp(defs->items[slot].name, defaults[index]) == 0) {
+                break;
+            }
+        }
+        if (slot == defs->count) {
+            forge_util_set_error(error, error_size,
+                      "registry default feature '%s' is not defined",
+                      defaults[index]);
+            return -1;
+        }
+        {
+            size_t name_length = strlen(defaults[index]);
+
+            memcpy(defs->defaults[defs->default_count], defaults[index],
+                   name_length + 1U);
+        }
+        ++defs->default_count;
+    }
+    return 0;
+}
+
+int forge_features_join(size_t count,
+                        const char names[][FORGE_FEATURE_NAME_MAX + 1U],
+                        char *out, size_t out_size)
+{
+    char ordered[FORGE_DEP_FEATURES_MAX + FORGE_RECIPE_FEATURES_MAX][FORGE_FEATURE_NAME_MAX + 1U];
+    size_t kept = 0U;
+    size_t used = 0U;
+    size_t slot;
+    size_t index;
+
+    if (out == NULL || out_size == 0U) {
+        return -1;
+    }
+    out[0] = '\0';
+    if (count > FORGE_DEP_FEATURES_MAX + FORGE_RECIPE_FEATURES_MAX) {
+        return -1;
+    }
+    for (slot = 0U; slot < count; ++slot) {
+        /* Overlong names never reach fixed buffers silently. */
+        if (strlen(names[slot]) > FORGE_FEATURE_NAME_MAX) {
+            return -1;
+        }
+        memcpy(ordered[slot], names[slot], strlen(names[slot]) + 1U);
+    }
+    /* Insertion sort plus dedupe into canonical order (memmove: the slots
+     * overlap by construction, which snprintf forbids). */
+    for (slot = 1U; slot < count; ++slot) {
+        char held[FORGE_FEATURE_NAME_MAX + 1U];
+        size_t held_at = slot;
+
+        memcpy(held, ordered[slot], sizeof(held));
+        while (held_at > 0U && strcmp(ordered[held_at - 1U], held) > 0) {
+            memmove(ordered[held_at], ordered[held_at - 1U],
+                    sizeof(ordered[held_at]));
+            --held_at;
+        }
+        memcpy(ordered[held_at], held, sizeof(held));
+    }
+    for (slot = 0U; slot < count; ++slot) {
+        if (kept != 0U &&
+            strcmp(ordered[slot], ordered[kept - 1U]) == 0) {
+            continue;
+        }
+        if (slot != kept) {
+            memmove(ordered[kept], ordered[slot], sizeof(ordered[kept]));
+        }
+        ++kept;
+    }
+    for (index = 0U; index < kept; ++index) {
+        size_t length = strlen(ordered[index]);
+
+        if (used + length + (index != 0U ? 1U : 0U) + 1U > out_size) {
+            return -1;
+        }
+        if (index != 0U) {
+            out[used++] = ',';
+        }
+        memcpy(out + used, ordered[index], length);
+        used += length;
+        out[used] = '\0';
+    }
+    return 0;
+}
+
+int forge_features_effective(const ForgeFeatureDefs *defs,
+                             const char declared[][FORGE_FEATURE_NAME_MAX + 1U],
+                             size_t ndeclared, int use_defaults,
+                             const char *dep_name,
+                             char *out, size_t out_size,
+                             char *error, size_t error_size)
+{
+    char merged[FORGE_DEP_FEATURES_MAX + FORGE_RECIPE_FEATURES_MAX][FORGE_FEATURE_NAME_MAX + 1U];
+    size_t nmerged = 0U;
+    size_t index;
+    size_t slot;
+
+    if (defs == NULL || out == NULL) {
+        forge_util_set_error(error, error_size, "feature definitions and output are required");
+        return -1;
+    }
+    for (index = 0U; index < ndeclared; ++index) {
+        for (slot = 0U; slot < defs->count; ++slot) {
+            if (strcmp(defs->items[slot].name, declared[index]) == 0) {
+                break;
+            }
+        }
+        if (slot == defs->count) {
+            if (defs->count == 0U) {
+                forge_util_set_error(error, error_size,
+                          "dependency '%s': unknown feature '%s' (the recipe "
+                          "defines no features)",
+                          dep_name != NULL ? dep_name : "?",
+                          declared[index]);
+            } else {
+                char available[512];
+                size_t used = 0U;
+                size_t pick;
+
+                available[0] = '\0';
+                for (pick = 0U; pick < defs->count; ++pick) {
+                    size_t length = strlen(defs->items[pick].name);
+
+                    if (used + length + 2U >= sizeof(available)) {
+                        break;
+                    }
+                    if (used != 0U) {
+                        available[used++] = ',';
+                        available[used++] = ' ';
+                    }
+                    memcpy(available + used, defs->items[pick].name, length);
+                    used += length;
+                    available[used] = '\0';
+                }
+                forge_util_set_error(error, error_size,
+                          "dependency '%s': unknown feature '%s' "
+                          "(available: %s)",
+                          dep_name != NULL ? dep_name : "?",
+                          declared[index], available);
+            }
+            return -1;
+        }
+        (void)snprintf(merged[nmerged], sizeof(merged[nmerged]), "%s",
+                       declared[index]);
+        ++nmerged;
+    }
+    if (use_defaults) {
+        for (slot = 0U; slot < defs->default_count; ++slot) {
+            (void)snprintf(merged[nmerged], sizeof(merged[nmerged]), "%s",
+                           defs->defaults[slot]);
+            ++nmerged;
+        }
+    }
+    if (forge_features_join(nmerged, merged, out, out_size) != 0) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s': feature set is too large",
+                  dep_name != NULL ? dep_name : "?");
+        return -1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Array selection (legacy helper retained for static registry indexes) */
 /* ------------------------------------------------------------------ */
 
@@ -1174,7 +1780,7 @@ static int json_array_select(const char *json, const char *array_key,
 
 static int query_file_registry(const char *base, const char *package,
                                const char *version,
-                               ForgeRegistryPin *pin,
+                               ForgeRegistryPin *pin, ForgeFeatureDefs *defs,
                                char *error, size_t error_size)
 {
     /* base is policy-checked already; strip the scheme, reject hosts. */
@@ -1274,6 +1880,11 @@ static int query_file_registry(const char *base, const char *package,
     }
     {
         if (parse_recipe(body, base, pin, error, error_size) != 0) return -1;
+        if (forge_registry_parse_features(body, defs, error, error_size) != 0) {
+            forge_util_prepend_error(error, error_size,
+                                     "registry recipe for '%s': ", package);
+            return -1;
+        }
     }
     return 0;
 }
@@ -1576,7 +2187,7 @@ static int resolve_floor(ForgeLogger *logger, const char *dep_name,
 
 int forge_registry_query(ForgeLogger *logger, const char *package,
                          const char *version, const char *tmp_path,
-                         ForgeRegistryPin *pin,
+                         ForgeRegistryPin *pin, ForgeFeatureDefs *defs,
                          char *error, size_t error_size)
 {
     char base[FORGE_PATH_MAX];
@@ -1586,11 +2197,12 @@ int forge_registry_query(ForgeLogger *logger, const char *package,
     int is_null = 0;
     int found;
 
-    if (pin == NULL || tmp_path == NULL) {
-        forge_util_set_error(error, error_size, "registry query needs a pin and scratch space");
+    if (pin == NULL || defs == NULL || tmp_path == NULL) {
+        forge_util_set_error(error, error_size, "registry query needs a pin, feature definitions, and scratch space");
         return -1;
     }
     memset(pin, 0, sizeof(*pin));
+    memset(defs, 0, sizeof(*defs));
     if (!package_name_is_portable(package)) {
         forge_util_set_error(error, error_size,
                   "'%s' is not a valid registry package name; use letters, "
@@ -1611,7 +2223,7 @@ int forge_registry_query(ForgeLogger *logger, const char *package,
         /* Static layout: no query strings exist for files. */
         (void)logger;
         (void)tmp_path;
-        return query_file_registry(base, package, version, pin,
+        return query_file_registry(base, package, version, pin, defs,
                                    error, error_size);
     }
     /* snprintf truncations are detected via the would-be length: a silently
@@ -1666,6 +2278,11 @@ int forge_registry_query(ForgeLogger *logger, const char *package,
         return -1;
     }
     if (parse_recipe(body, base, pin, error, error_size) != 0) {
+        forge_util_prepend_error(error, error_size,
+                                  "registry response for '%s': ", package);
+        return -1;
+    }
+    if (forge_registry_parse_features(body, defs, error, error_size) != 0) {
         forge_util_prepend_error(error, error_size,
                                   "registry response for '%s': ", package);
         return -1;

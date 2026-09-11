@@ -42,6 +42,12 @@ typedef struct ForgeDepNode {
      * against what actually resolved rather than the declared spelling. */
     char resolved_version[FORGE_MANIFEST_VALUE_MAX];
     unsigned resolved_revision;
+    /* Registry nodes only: canonical comma-joined feature sets. `features`
+     * is the effective set the node builds with; `defaults` is the recipe's
+     * default set, kept so later declarations expand against the same
+     * recipe view (definitions are gone by then). */
+    char features[FORGE_FEATURES_JOINED_MAX];
+    char defaults[FORGE_FEATURES_JOINED_MAX];
     ForgeManifest *manifest;
     int is_native;
     /* Filled by the build stage: native deps point at their objects.txt
