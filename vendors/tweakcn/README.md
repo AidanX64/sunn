@@ -10,5 +10,5 @@ here following the `forge/SOURCE.md` pattern
 npm dependency was insufficient.
 
 JS vendors become `workspaces` entries in the root `package.json` only
-when they contain their own `package.json` (Bun workspaces; the old
-`pnpm-workspace.yaml` mechanism is gone since the Bun switch).
+when they contain their own `package.json`. Use Bun workspaces if a
+second JavaScript package is added.

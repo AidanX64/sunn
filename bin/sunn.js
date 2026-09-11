@@ -7,7 +7,7 @@
  *   sunn init <dir>         scaffold a working copy from this package
  *   sunn help               this text
  *
- * Installed via `npm i -g @v1dxu/sunn` (or `bunx @v1dxu/sunn serve`).
+ * Installed via `bunx sunn` (or `bun add -g sunn`).
  */
 
 const { spawn } = require("child_process");
@@ -28,12 +28,12 @@ function usage() {
 
 Usage:
   sunn serve [--port N]   start the registry (default port 3000)
-  sunn init <dir>         scaffold a working copy from the GitHub release
+  sunn init <dir>         scaffold a working copy from this package
   sunn help               show this text
 
 Examples:
-  npx @v1dxu/sunn serve --port 3100
-  npx @v1dxu/sunn init ./my-registry`);
+  bunx sunn serve --port 3100
+  bunx sunn init ./my-registry`);
 }
 
 /* The standalone server resolves ./public and ./.next/static relative to
@@ -43,7 +43,7 @@ function ensureStandaloneAssets() {
   if (!fs.existsSync(SERVER)) {
     fail(
       "standalone server not found — this copy was not built with `next build` " +
-        "(output: \"standalone\"). Reinstall @v1dxu/sunn from the registry."
+        "(output: \"standalone\"). Reinstall sunn from the registry."
     );
   }
   const pairs = [

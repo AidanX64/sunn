@@ -2,129 +2,334 @@
 
 ## Project overview
 
-sunn is a monorepo with one web app at the repo root and vendored
-companions. Long-term vision: half shadcn registry, half vcpkg/conan-style
-registry for C/C++/ASM, powered by the forge build tool. All of it is
-called sunn.
+sunn is a self-hostable hybrid developer registry and the home of the Forge ecosystem.
 
-- **Web** (this repo root): Next.js 15 + Tailwind v3 + shadcn. A shadcn
-  component registry (`registry/` + `registry.json`) next to a native
-  C/C++/ASM package registry (`public/packages/` + `/packages` UI +
-  `/api/*`). The landing hero runs a WebGPU shader.
-- **`forge/`**: vendored copy of the standalone forge repo (Cargo-like
-  build orchestration for C/C++/assembly, written in C). Upstream at
-  `C:\Users\dooms\source\forge` is the source of truth —
-  **never edit `forge/` C sources directly**; change upstream, verify
-  there, then `sync-forge` (see below).
-- **`vendors/`**: reserved slots (`openshaders`, `tweakcn`, `shadcn-ui`).
-  Decision records live in each README; nothing is vendored there yet.
+It combines two complementary package ecosystems:
 
-`forge/AGENTS.md` governs all C work (language rules, subcommand
-conventions, test procedure). This file governs the monorepo around it.
+- A shadcn-style source registry for web development.
+- A vcpkg/Conan-style native package registry for C, C++, and assembly.
 
-## Layout
+The long-term goal is for both ecosystems to be provided by Sunn while preserving their different installation models.
 
-```
-app/                  Next.js routes (/, /packages, /forge, /api/*, /registry/*)
-components/           local React (sunn-shader-background, mode-toggle, ui/*)
-lib/                  custom-shaders.js (WebGPU engine) + sunn-registry.ts (zod)
-registry/             shadcn distributables + registry.json
-public/packages/      native registry hosting (sunn.registry.json + per-version JSON)
-public/r/             built shadcn registry output (checked in, from `shadcn build`)
-registry-fixtures/    fixture sources (hello-c/cpp/asm) packed by script
-forge/                vendored forge (see forge/SOURCE.md)
-vendors/              future companions (READMEs only for now)
-scripts/              sync-forge.*, package-registry-fixtures.*
-```
+### Web ecosystem
 
-## Commands (run from repo root)
+The web registry contains source-oriented developer building blocks:
+
+- React components
+- shadcn/ui components
+- hooks
+- utilities
+- shaders
+- WebGPU/WebGL components
+- templates
+- other reusable frontend source
+
+The intended web installation experience is:
 
 ```sh
-bun run dev                 # web dev server (webpack; see Turbopack gotcha)
-bun run build               # Next.js production build (runs typecheck)
-bunx tsc --noEmit           # fast typecheck
-bun run registry:build      # shadcn build -> public/r
-bun run packages:fixtures   # rebuild fixture tarballs + public/packages metadata
-bun run forge:build         # make -C forge CC=gcc
-bun run forge:test          # make -C forge test
-bun run forge:clean         # make -C forge clean
-bun run sync:forge          # re-copy upstream forge (preserves forge/SOURCE.md)
+bunx sunn@latest add button
+bunx sunn@latest add shader/aurora
+bunx sunn@latest add command-palette
 ```
 
-Full C verification lives upstream (`make clean && make CC=gcc`,
-fixture runs, `make regression`); see `forge/AGENTS.md`.
+Web registry items follow the shadcn philosophy: source is copied into the user's project so it can be inspected, modified, and owned by the user.
 
-## Conventions for agents working in this repo
+The Sunn web CLI runs through Bun/Bunx and communicates with the Sunn web/source registry.
 
-- **Web stays at root.** Do not move it to `apps/web`: `@/*` aliases,
-  `components.json`, and `shadcn build` paths all assume root.
-- **No Turborepo.** `bun run` scripts + `make -C forge` is the orchestration.
-  Revisit only when a second JS buildable appears.
-- **Never run pnpm/npm in this repo.** pnpm v12 auto-recreates
-  `pnpm-lock.yaml` + `pnpm-workspace.yaml` on any invocation
-  (`verify-deps-before-run`), dirtying the tree behind your back. Use
-  `bun run …` for JS and `make -C forge …` directly for C (the
-  `forge:*` scripts are plain make passthroughs).
-- **Two registries, don't mix them.** `registry.json` is shadcn-owned
-  (`shadcn build` breaks on unknown item types). Native packages live in
-  `public/packages/sunn.registry.json`, validated by
-  `lib/sunn-registry.ts`. The forge resolve contract is
-  `GET /api/forge/v1/resolve?name=&version=&triplet=`.
-- **Install settings live in `package.json`, NOT `pnpm-workspace.yaml`**
-  (Bun ignores that file, and it is deleted). Overrides plus
-  `trustedDependencies` (`sharp`, `unrs-resolver`) live in
-  `package.json`. The zod tree is intentionally mixed: v3 at root
-  (shadcn's schemas call `.deepPartial()`, removed in v4) and v4 under
-  `@modelcontextprotocol/sdk` (1.30 imports `zod/v3`, which only exists
-  in the v4 package). Do not "unify" it without running
-  `bun run registry:build`.
-- **Bun-first:** Bun 1.4+ pinned in `.bun-version` (Next CLIs run via
-  `bun --bun`). Node `>= 20.18.1` remains the fallback floor
-  (`.nvmrc`); the tree was last verified on Node 24.
-  `bunx shadcn build` is the canary.
-- **Shader seam:** `lib/custom-shaders.js` is the engine,
-  `components/sunn-shader-background.tsx` the wrapper (theme sync,
-  WebGPU-missing fallback, cleanup). Openshaders integration, when it
-  happens, goes behind the wrapper's props — not a rewrite of call sites.
-- **Fixtures, not releases:** `hello-c/cpp/asm` are library-shaped
-  sources (objects, never a `main` — deps link every object). Tarballs
-  are per-version sources, one file referenced by every triplet; real
-  per-triplet binaries are a later CI phase (see
-  `public/packages/README.md`).
-- **Env for registry work:** `FORGE_REGISTRY_URL` (required by the CLI),
-  `FORGE_ALLOW_UNSAFE_REGISTRY=1` (local `file://` registries/tests).
-- **After touching `forge/`:** rebuild + rerun the vendored suite, and
-  remember the copy flows upstream → sunn, never the reverse. See
-  `forge/SOURCE.md`.
-- **Commits:** conventional style (`feat:`, `fix:`, `docs:`), short
-  subjects. Never commit `forge/build/`, `forge/target/`, `.next/`,
-  or `node_modules/` (all ignored).
-- **Releases (`@v1dxu/sunn`, one package, manual semver):** bump
-  `version` in `package.json` → commit → tag `vX.Y.Z` → push the tag.
-  The `publish` workflow re-runs every gate (frozen install, tsc,
-  lint, build, registry drift check), refuses mismatched tag/version,
-  then `npm publish --provenance`. First-ever publish is manual
-  (`npm publish --access public` from the `v1dxu` login — the package
-  must exist before npm lets you register it as a trusted publisher);
-  after that OIDC handles it. Never commit npm tokens. Keep
-  `publishConfig` to `access` only: npm hard-fails local publishes on
-  a configured-but-unsatisfiable `provenance` (EUSAGE), and JSON
-  forbids `//` comments anywhere in `package.json` (strict parsers —
-  Browserslist, webpack, npm itself — reject them even though Bun and
-  tsc tolerate them, which hides the breakage locally).
+It is not a traditional npm package manager and should not turn registry items into opaque `node_modules` dependencies.
 
-## Gotchas already learned here (don't rediscover)
+### Native ecosystem
 
-- forge's own Makefile tracks headers (`-MMD -MP`); still, after header
-  changes prefer `make clean && make CC=gcc` — stale objects crash
-  opaquely (exit `0xC0000005`, buffered output lost).
-- On MSYS2/Git-Bash, native System32 curl/tar must precede MSYS ones on
-  PATH: MSYS `tar` cannot run as a grandchild of a native process (its
-  gzip helper will not spawn). The regression script handles this; plain
-  shells need it too.
-- `bun run registry:build` output (`public/r/`) is committed; regenerate it
-  when `registry/` changes.
-- `bun run dev` is webpack (no `--turbopack`): Turbopack dev hard-fails
-  parsing `tw-animate-css` (Tailwind v4 syntax in `@import`) under the v3
-  pipeline — reproduced identically on Node, so it is a repo issue, not a
-  Bun issue. Re-add the flag only after that import is resolved.
+The native registry contains reusable C, C++, and assembly packages.
+
+The native Forge executable is responsible for native package management and build orchestration.
+
+The intended native workflow is:
+
+```sh
+forge add fmt
+forge add glfw
+forge add my-library
+```
+
+Forge handles native concerns including:
+
+- dependency resolution
+- package versions
+- lockfiles
+- checksums
+- source retrieval
+- platform/triplet selection
+- native builds
+- package metadata
+- future binary/artifact support
+
+The native Forge implementation is written in C.
+
+### Sunn and Forge ecosystem
+
+There are two Sunn consumers with different runtimes:
+
+```text
+Web
+  bunx sunn@latest add <item>
+        │
+        └── Sunn web/source registry
+                │
+                └── source assets
+
+Native
+  forge
+        │
+        └── Sunn native registry
+                │
+                └── C/C++/ASM packages
+```
+
+The shared concept is a unified Sunn ecosystem with separate web-source and native-package workflows.
+
+Do not confuse this with making the web and native package formats identical. They have different semantics and should retain appropriate schemas and workflows.
+
+## Repository architecture
+
+```text
+sunn/
+├── app/                    Next.js web application
+├── components/             React components
+├── lib/                    shared web/registry functionality
+├── registry/               shadcn-style web registry sources
+├── public/packages/        native package registry
+├── public/r/               built shadcn registry output
+├── registry-fixtures/      native registry test fixtures
+├── forge/                  vendored native Forge source
+├── vendors/                future registry integrations
+└── scripts/                registry/build/synchronization scripts
+```
+
+The Sunn web application is the registry frontend and server.
+
+The Sunn web CLI is a Bun/TypeScript CLI distributed through the Bun/npm ecosystem.
+
+The native Forge implementation remains the standalone C project vendored under `forge/`.
+
+## Web registry
+
+The web registry uses the shadcn registry format.
+
+The existing shadcn registry files include:
+
+```text
+registry.json
+registry/
+public/r/
+```
+
+`registry.json` remains compatible with `shadcn build`.
+
+Do not put native package definitions into the shadcn registry schema.
+
+The Sunn web CLI should consume the registry in a way that preserves the shadcn source-oriented model.
+
+A web registry item should be installable by name, for example:
+
+```sh
+bunx sunn@latest add button
+bunx sunn@latest add shader/aurora
+```
+
+Names may use namespaces/categories such as:
+
+```text
+shader/aurora
+shader/fluid
+shader/noise
+```
+
+The CLI should resolve the requested item from the Sunn registry, retrieve its source, and place it into the appropriate project location according to the registry item's metadata.
+
+Do not make web installation dependent on the native Forge binary.
+
+## Native registry
+
+The native registry is independent of the shadcn registry.
+
+Native packages live under:
+
+```text
+public/packages/
+```
+
+and use the Sunn native registry schema validated by:
+
+```text
+lib/sunn-registry.ts
+```
+
+Forge currently resolves native packages through:
+
+```text
+GET /api/forge/v1/resolve?name=&version=&triplet=
+```
+
+Preserve this contract unless there is a concrete reason to version or replace it.
+
+Native fixture packages are currently source packages. They are not production binary releases.
+
+Per-triplet binary artifacts are a future phase.
+
+## Forge source of truth
+
+`forge/` is a vendored copy of the standalone Forge repository.
+
+The upstream Forge repository is the source of truth.
+
+Never edit C sources directly inside the vendored `forge/` tree.
+
+Forge changes must be made upstream, verified there, and then synchronized into Sunn using the existing synchronization workflow.
+
+See:
+
+```text
+forge/AGENTS.md
+forge/SOURCE.md
+```
+
+for Forge-specific rules.
+
+## Technology stack
+
+### Sunn web platform
+
+Use the existing stack:
+
+- Next.js
+- React
+- TypeScript
+- Tailwind CSS
+- shadcn/ui
+- Bun
+
+Do not migrate the web application to another framework without explicit approval.
+
+Do not introduce Node.js as the primary JavaScript runtime when Bun can perform the task.
+
+### Sunn web CLI
+
+Use:
+
+- Bun
+- TypeScript
+
+The CLI must be distributable through the Bun/npm ecosystem so that the intended usage is:
+
+```sh
+bunx sunn@latest add <item>
+```
+
+The web CLI should remain lightweight and focused on registry consumption.
+
+### Native Forge
+
+Use:
+
+- C
+- C++
+- Assembly where appropriate
+
+Follow `forge/AGENTS.md` for native implementation rules.
+
+## Package-manager boundaries
+
+Do not collapse the two package ecosystems into one generic package model.
+
+Sunn web CLI:
+
+```text
+bunx sunn@latest add <source-item>
+```
+
+Native Forge:
+
+```text
+forge add <native-package>
+```
+
+The web side is source-oriented and shadcn-like.
+
+The native side is dependency/build-oriented and vcpkg/Conan/Cargo-like.
+
+Both are part of the Sunn/Forge ecosystem.
+
+## Current implementation vs target implementation
+
+Agents must distinguish between functionality that exists today and functionality that is part of the target architecture.
+
+Currently, the published `sunn` package provides the Sunn registry/self-hosting CLI:
+
+```sh
+sunn serve
+sunn init <dir>
+sunn help
+sunn --version
+```
+
+The native Forge implementation already provides native package-management functionality.
+
+The Sunn web CLI and commands such as:
+
+```sh
+bunx sunn@latest add button
+bunx sunn@latest add shader/aurora
+```
+
+are target functionality unless verified as implemented in the current repository.
+
+Never document target functionality as currently working unless it has been implemented and tested.
+
+## Development commands
+
+Use Bun for the Sunn web project:
+
+```sh
+bun run dev
+bun run build
+bunx tsc --noEmit
+bun run registry:build
+bun run packages:fixtures
+```
+
+Native Forge:
+
+```sh
+bun run forge:build
+bun run forge:test
+bun run forge:clean
+```
+
+Synchronizing Forge:
+
+```sh
+bun run sync:forge
+```
+
+Use Bun for repository development and dependency installation.
+
+## General implementation rules
+
+Before making architectural changes:
+
+1. Read the relevant existing implementation.
+2. Determine what already works.
+3. Preserve working behavior.
+4. Avoid speculative abstractions.
+5. Keep web and native registry schemas separate.
+6. Do not invent undocumented behavior.
+7. Add tests for new functionality.
+8. Update documentation when CLI behavior changes.
+9. Verify commands before claiming they work.
+
+Prefer incremental implementation over broad rewrites.
+
+The goal is not to clone shadcn, vcpkg, Conan, or Cargo.
+
+The goal is to combine their strongest ideas into a unified Sunn/Forge ecosystem with a clean developer experience.

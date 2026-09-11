@@ -21,7 +21,7 @@ export default function ForgePage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Build the vendored copy</CardTitle>
+          <CardTitle>Build native Forge</CardTitle>
           <CardDescription>
             Per <code>forge/AGENTS.md</code>: mingw-w64 gcc on Windows, strict{" "}
             <code>-Wall -Wextra -Werror -std=c2x</code>.
@@ -34,8 +34,8 @@ export default function ForgePage() {
 # expect: Hello world! (rerun prints up-to-date:, no recompiles)`}
           </pre>
           <pre className="text-xs rounded-lg bg-muted p-3 overflow-x-auto">
-{`pnpm forge:build
-pnpm forge:test`}
+{`bun run forge:build
+bun run forge:test`}
           </pre>
         </CardContent>
       </Card>
@@ -44,7 +44,7 @@ pnpm forge:test`}
         <CardHeader>
           <CardTitle>Registry attachment</CardTitle>
           <CardDescription>
-            forge stays a separate CLI; sunn serves it metadata.
+            Native Forge stays a separate C CLI; Sunn serves its registry metadata.
           </CardDescription>
         </CardHeader>
         <CardContent className="text-sm flex flex-col gap-2">

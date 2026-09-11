@@ -1,7 +1,7 @@
 {
-  "name": "@v1dxu/sunn",
+  "name": "sunn",
   "version": "0.1.0",
-  "description": "sunn: a shadcn component registry next to a native C/C++/ASM package registry, with the forge build tool. Self-hostable via `sunn serve`.",
+  "description": "Sunn: a source-oriented web registry and native C/C++/ASM package registry. Self-hostable via `sunn serve`.",
   "license": "MIT",
   "repository": {
     "type": "git",
