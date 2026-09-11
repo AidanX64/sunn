@@ -224,13 +224,15 @@ case "$(uname -s)" in
         mkdir -p "$bindir"
         host_cc="$(command -v gcc || command -v clang || command -v cc)" \
             || fail "R6: no host compiler found to alias"
-        ln -s "$host_cc" "$bindir/local-cluster-gcc"
+        # Keep "cl" only in the parent path: Apple Clang's driver mode can
+        # vary when invoked through a name ending in "gcc".
+        ln -s "$host_cc" "$bindir/local-cluster-cc"
 
         proj="$work/r6"
         mkdir -p "$proj/src"
         write_manifest "$proj/Forge.toml" "r6" \
             "[build]" \
-            "compiler = \"$bindir/local-cluster-gcc\""
+            "compiler = \"$bindir/local-cluster-cc\""
         echo 'int main(void) { return 0; }' >"$proj/src/main.c"
 
         "$FORGE" check --manifest "$proj/Forge.toml" >/dev/null 2>&1 \
