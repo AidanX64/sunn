@@ -224,21 +224,30 @@ case "$(uname -s)" in
         mkdir -p "$bindir"
         host_cc="$(command -v gcc || command -v clang || command -v cc)" \
             || fail "R6: no host compiler found to alias"
-        # Keep "cl" only in the parent path: Apple Clang's driver mode can
-        # vary when invoked through a name ending in "gcc".
-        ln -s "$host_cc" "$bindir/local-cluster-cc"
+        # Keep "cl" only in the parent path: the alias itself uses the
+        # standard "cc" driver name because Apple Clang's driver behavior
+        # varies when invoked through an unrecognized symlink name (both
+        # local-cluster-gcc and local-cluster-cc failed on macos-latest).
+        # Basename "cc" still classifies as GCC by spelling, so the parent
+        # directory carries the "cl" regression coverage: a whole-path
+        # substring scan for "cl" would still misfire on it.
+        ln -s "$host_cc" "$bindir/cc"
 
         proj="$work/r6"
         mkdir -p "$proj/src"
         write_manifest "$proj/Forge.toml" "r6" \
             "[build]" \
-            "compiler = \"$bindir/local-cluster-cc\""
+            "compiler = \"$bindir/cc\""
         echo 'int main(void) { return 0; }' >"$proj/src/main.c"
 
-        "$FORGE" check --manifest "$proj/Forge.toml" >/dev/null 2>&1 \
-            || fail "R6: override path containing 'cl' was misclassified as MSVC"
+        # Probe the alias first so an uninvocable symlink/driver shows up
+        # directly instead of hiding behind the misclassification message.
+        "$bindir/cc" --version >"$work/r6.probe" 2>&1 \
+            || { cat "$work/r6.probe" >&2; fail "R6: compiler alias is not invocable"; }
+        "$FORGE" check --manifest "$proj/Forge.toml" >"$work/r6.check" 2>&1 \
+            || { cat "$work/r6.check" >&2; r6log="$(latest_log "$proj" 2>/dev/null)" && [ -n "$r6log" ] && cat "$r6log" >&2; fail "R6: override path containing 'cl' was misclassified as MSVC"; }
         grep -qF '(gcc)' "$(latest_log "$proj")" \
-            || fail "R6: dispatch did not report a GCC-classified driver"
+            || { cat "$(latest_log "$proj")" >&2; fail "R6: dispatch did not report a GCC-classified driver"; }
         pass "R6: 'cl' substrings in override paths no longer imply MSVC"
         ;;
 esac
