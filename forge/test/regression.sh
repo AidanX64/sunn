@@ -18,6 +18,14 @@
 # Like deps-regression.sh, everything runs inside a throwaway sandbox.
 set -u
 
+replace_in_file() {
+    if sed --version >/dev/null 2>&1; then
+        sed -i "$1" "$2"
+    else
+        sed -i '' "$1" "$2"
+    fi
+}
+
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 
@@ -142,7 +150,7 @@ pass "R3: projects under spaced paths stay incremental"
 cpplib="$work/cpp-lib"
 mkdir -p "$cpplib/src"
 write_manifest "$cpplib/Forge.toml" "cpplib"
-sed -i 's/^cpp = \[\]$/cpp = ["src"]/' "$cpplib/Forge.toml"
+replace_in_file 's/^cpp = \[\]$/cpp = ["src"]/' "$cpplib/Forge.toml"
 cat >"$cpplib/src/lib.cpp" <<'EOF'
 extern "C" int cpp_slot(void)
 {
