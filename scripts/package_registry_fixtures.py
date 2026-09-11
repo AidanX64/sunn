@@ -24,16 +24,6 @@ ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "registry-fixtures"
 OUT = ROOT / "public" / "packages"
 
-OS_ARCH_TO_TRIPLET = {
-    ("windows", "x86_64"): "x64-windows",
-    ("windows", "aarch64"): "arm64-windows",
-    ("linux", "x86_64"): "x64-linux",
-    ("linux", "aarch64"): "arm64-linux",
-    ("macos", "x86_64"): "x64-macos",
-    ("macos", "aarch64"): "arm64-macos",
-}
-
-
 def parse_toml_list(text: str, key: str) -> list[str]:
     m = re.search(rf"{key}\s*=\s*\[([^\]]*)\]", text)
     if not m:
@@ -68,12 +58,6 @@ def main() -> int:
         cpp = parse_toml_list(manifest, r"\bcpp\b")
         asm = parse_toml_list(manifest, r"\basm\b")
         lang = "c" if c else ("c++" if cpp else "asm")
-        oss = parse_toml_list(manifest, r"\bos\b")
-        arches = parse_toml_list(manifest, r"\barch\b")
-        triplets = sorted(
-            {OS_ARCH_TO_TRIPLET.get((o, a), f"{a}-{o}") for o in oss for a in arches}
-        )
-
         pkg_dir = OUT / name
         pkg_dir.mkdir(parents=True, exist_ok=True)
         tarball = pkg_dir / f"{name}-{version}.tar.gz"
@@ -95,11 +79,9 @@ def main() -> int:
             "homepage": "https://example.com/" + name,
             "lang": lang,
             "build": "forge",
-            "triplets": triplets,
             "dependencies": [],
-            "artifacts": [
-                {"triplet": t, "url": url, "sha256": sha256} for t in triplets
-            ],
+            "source": {"kind": "url", "location": url, "sha256": sha256},
+            "patches": [],
             "forge": {"manifest": f"/packages/{name}/Forge.toml"},
         }
         (pkg_dir / f"{version}.json").write_text(json.dumps(pkg_json, indent=2) + "\n")
@@ -112,7 +94,7 @@ def main() -> int:
             "homepage": pkg_json["homepage"],
             "index": f"/packages/{name}/{version}.json",
         }
-        print(f"{name} {version}: {tarball.name} sha256={sha256[:16]}... ({len(triplets)} triplets)")
+        print(f"{name} {version}: {tarball.name} sha256={sha256[:16]}...")
 
     index["packages"] = [entries[k] for k in sorted(entries)]
     index_path.write_text(json.dumps(index, indent=2) + "\n")

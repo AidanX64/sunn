@@ -44,9 +44,11 @@ export default async function PackageDetailPage({
       throw new Error(`registry drift for ${entry.name}`)
     }
 
-    const forgeCmd = `forge add ${pkg.name} --git https://sunn.local/packages/${pkg.name}`
-    const vcpkgCmd = pkg.vcpkg ? `vcpkg add port ${pkg.vcpkg.port}` : "# no vcpkg port mapped yet"
-    const conanCmd = pkg.conan ? `conan install ${pkg.conan.ref}` : "# no conan ref mapped yet"
+    const forgeCmd = `forge add ${pkg.name} --registry ${pkg.name} --version ${pkg.version}`
+    const sourceDescription =
+      pkg.source.kind === "git"
+        ? `${pkg.source.location} @ ${pkg.source.ref}`
+        : `${pkg.source.location} (sha256 ${pkg.source.sha256})`
 
     return (
       <div className="max-w-3xl mx-auto flex flex-col min-h-svh px-4 py-8 gap-6">
@@ -64,8 +66,8 @@ export default async function PackageDetailPage({
           <CardHeader>
             <CardTitle>Install</CardTitle>
             <CardDescription>
-              Static MVP — artifacts are placeholders until real tarballs land in{" "}
-              <code>public/packages</code>.
+              Forge resolves this recipe, fetches the upstream source, applies
+              any patches, and builds it locally.
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
@@ -74,18 +76,8 @@ export default async function PackageDetailPage({
               <pre className="text-xs rounded-lg bg-muted p-3 overflow-x-auto">{forgeCmd}</pre>
             </div>
             <div>
-              <p className="text-sm font-medium mb-1">vcpkg</p>
-              <pre className="text-xs rounded-lg bg-muted p-3 overflow-x-auto">{vcpkgCmd}</pre>
-            </div>
-            <div>
-              <p className="text-sm font-medium mb-1">conan</p>
-              <pre className="text-xs rounded-lg bg-muted p-3 overflow-x-auto">{conanCmd}</pre>
-            </div>
-            <div>
-              <p className="text-sm font-medium mb-1">CMake (FetchContent)</p>
-              <pre className="text-xs rounded-lg bg-muted p-3 overflow-x-auto">
-{`FetchContent_Declare(${pkg.name} URL https://sunn.local${pkg.artifacts[0]?.url ?? "/packages/…tar.gz"})`}
-              </pre>
+              <p className="text-sm font-medium mb-1">recipe source</p>
+              <pre className="text-xs rounded-lg bg-muted p-3 overflow-x-auto">{sourceDescription}</pre>
             </div>
           </CardContent>
         </Card>
@@ -99,7 +91,7 @@ export default async function PackageDetailPage({
             <p>build: {pkg.build}</p>
             <p>license: {pkg.license || "—"}</p>
             <p>homepage: {pkg.homepage || "—"}</p>
-            <p>triplets: {pkg.triplets.join(", ") || "—"}</p>
+            <p>patches: {pkg.patches.join(", ") || "none"}</p>
             <p>manifest: {pkg.forge?.manifest ?? "—"}</p>
           </CardContent>
         </Card>

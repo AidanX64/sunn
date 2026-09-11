@@ -20,22 +20,16 @@ export const packageVersionSchema = z
     "version must be MAJOR.MINOR.PATCH"
   )
 
-export const tripletSchema = z
-  .string()
-  .min(1)
-  .max(32)
-  .regex(/^(x64|arm64)-(windows|linux|macos)$/, "unknown triplet")
-
-const relativeArtifactUrlSchema = z
+const relativeSourceUrlSchema = z
   .string()
   .min(1)
   .max(2048)
   .regex(
     /^\/packages\/[A-Za-z0-9_-]+\/[A-Za-z0-9._-]+\.tar\.gz$/,
-    "artifact url must be /packages/<name>/<file>.tar.gz or https://…"
+    "source url must be /packages/<name>/<file>.tar.gz or https://…"
   )
 
-const absoluteArtifactUrlSchema = z.string().url().max(2048)
+const sourceUrlSchema = z.union([relativeSourceUrlSchema, z.string().url().max(2048)])
 
 const sha256Schema = z
   .string()
@@ -59,13 +53,28 @@ const indexPathSchema = z
     "bad index pointer"
   )
 
-export const artifactSchema = z
-  .object({
-    triplet: tripletSchema,
-    url: z.union([relativeArtifactUrlSchema, absoluteArtifactUrlSchema]),
-    sha256: sha256Schema,
-  })
-  .strict()
+const patchNameSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*\.patch$/, "invalid patch name")
+
+const gitSourceSchema = z.object({
+  kind: z.literal("git"),
+  location: z.string().url().max(2048),
+  ref: z.string().min(1).max(256),
+}).strict()
+
+const urlSourceSchema = z.object({
+  kind: z.literal("url"),
+  location: sourceUrlSchema,
+  sha256: sha256Schema,
+}).strict()
+
+export const registrySourceSchema = z.discriminatedUnion("kind", [
+  gitSourceSchema,
+  urlSourceSchema,
+])
 
 export const nativePackageSchema = z
   .object({
@@ -76,31 +85,12 @@ export const nativePackageSchema = z
     homepage: homepageSchema.default(""),
     lang: z.enum(["c", "c++", "asm"]),
     build: z.literal("forge").default("forge"),
-    triplets: z.array(tripletSchema).max(16).default([]),
     dependencies: z.array(packageNameSchema).max(100).default([]),
-    artifacts: z.array(artifactSchema).max(16).default([]),
-    vcpkg: z.object({ port: z.string().max(128), version: z.string().max(32) }).strict().optional(),
-    conan: z.object({ ref: z.string().max(256), recipe: z.string().max(256) }).strict().optional(),
+    source: registrySourceSchema,
+    patches: z.array(patchNameSchema).max(32).default([]),
     forge: z.object({ manifest: manifestPathSchema }).strict().optional(),
   })
   .strict()
-  .superRefine((pkg, ctx) => {
-    const seen = new Set<string>()
-    for (const t of pkg.triplets) {
-      if (seen.has(t)) {
-        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `duplicate triplet ${t}` })
-      }
-      seen.add(t)
-    }
-    for (const a of pkg.artifacts) {
-      if (!seen.has(a.triplet)) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `artifact triplet ${a.triplet} not listed in triplets`,
-        })
-      }
-    }
-  })
 
 export type NativePackage = z.infer<typeof nativePackageSchema>
 

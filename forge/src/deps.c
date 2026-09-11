@@ -39,17 +39,17 @@
 #define FORGE_SCAN_MAX_DEPTH 64U
 #define FORGE_LOCK_LINE_MAX 4096U
 
-/* One pinned dependency as recorded in Forge.lock: git entries pin a
- * commit (`commit` + `url` + `ref`), registry entries a version
- * (`version` + `sha256` + `url`). Exactly one shape is ever populated. */
+/* One pinned dependency as recorded in Forge.lock. Plain git entries retain
+ * their historical shape; registry entries carry an explicit source kind. */
 typedef struct ForgeLockEntry {
     char name[FORGE_DEPS_VALUE_MAX];
     char commit[FORGE_DEPS_VALUE_MAX];
-    /* Artifact URLs (CDN-signed especially) outgrow manifest values. */
     char url[FORGE_PATH_MAX];
     char ref[FORGE_DEPS_VALUE_MAX];
     char version[FORGE_DEPS_VALUE_MAX];
     char sha256[FORGE_DEPS_VALUE_MAX];
+    char kind[8];
+    char location[FORGE_PATH_MAX];
 } ForgeLockEntry;
 
 typedef struct ForgeLockFile {
@@ -557,12 +557,13 @@ static void discard_cache_dir(const char *cache_dir)
  * a matching lock pin still checks out locally, anything else fails here,
  * before git can run.
  */
-static int ensure_git_checkout(ForgeLogger *logger, const char *name, const char *url,
-                               const char *ref, const char *locked_commit,
-                               int force_update, int submodules, int offline,
-                               const char *cache_dir,
-                               char *resolved_sha, size_t resolved_sha_size,
-                               char *error, size_t error_size)
+int forge_deps_ensure_git_checkout(ForgeLogger *logger, const char *name,
+                                   const char *url, const char *ref,
+                                   const char *locked_commit, int force_update,
+                                   int submodules, int offline,
+                                   const char *cache_dir,
+                                   char *resolved_sha, size_t resolved_sha_size,
+                                   char *error, size_t error_size)
 {
     char capture[FORGE_PATH_MAX];
     char origin_target[FORGE_DEPS_VALUE_MAX + 8U];
@@ -766,14 +767,20 @@ static int write_lockfile_body(void *user_data, FILE *file)
         const ForgeLockEntry *entry = &lock->items[index];
 
         if (entry->commit[0] != '\0') {
-            if (fprintf(file, "%s = { commit = \"%s\", url = \"%s\", ref = \"%s\" }\n",
+            if (entry->kind[0] != '\0') {
+                if (fprintf(file, "%s = { kind = \"%s\", version = \"%s\", location = \"%s\", ref = \"%s\", commit = \"%s\" }\n",
+                            entry->name, entry->kind, entry->version,
+                            entry->location, entry->ref, entry->commit) < 0) {
+                    return -1;
+                }
+            } else if (fprintf(file, "%s = { commit = \"%s\", url = \"%s\", ref = \"%s\" }\n",
                         entry->name, entry->commit, entry->url, entry->ref) < 0) {
                 return -1;
             }
         } else {
-            if (fprintf(file, "%s = { version = \"%s\", sha256 = \"%s\", url = \"%s\" }\n",
-                        entry->name, entry->version, entry->sha256,
-                        entry->url) < 0) {
+            if (fprintf(file, "%s = { kind = \"%s\", version = \"%s\", location = \"%s\", sha256 = \"%s\" }\n",
+                        entry->name, entry->kind, entry->version,
+                        entry->location, entry->sha256) < 0) {
                 return -1;
             }
         }
@@ -925,8 +932,29 @@ static int load_lockfile(const char *path, ForgeLockFile *lock,
                 (void)snprintf(entry->version, sizeof(entry->version), "%s", value);
             } else if (strcmp(key_start, "sha256") == 0) {
                 (void)snprintf(entry->sha256, sizeof(entry->sha256), "%s", value);
+            } else if (strcmp(key_start, "kind") == 0) {
+                (void)snprintf(entry->kind, sizeof(entry->kind), "%s", value);
+            } else if (strcmp(key_start, "location") == 0) {
+                (void)snprintf(entry->location, sizeof(entry->location), "%s", value);
             }
             cursor = quote + 1;
+        }
+        if (entry->kind[0] != '\0') {
+            if ((strcmp(entry->kind, "git") == 0 &&
+                 (entry->version[0] == '\0' || entry->location[0] == '\0' ||
+                  entry->ref[0] == '\0' || !is_full_git_sha(entry->commit))) ||
+                (strcmp(entry->kind, "url") == 0 &&
+                 (entry->version[0] == '\0' || entry->location[0] == '\0' ||
+                  !is_full_sha256(entry->sha256) || entry->commit[0] != '\0')) ||
+                (strcmp(entry->kind, "git") != 0 && strcmp(entry->kind, "url") != 0)) {
+                forge_util_set_error(error, error_size,
+                          "%s: dependency '%s' has a malformed registry pin; "
+                          "delete Forge.lock and run 'forge update' to regenerate it",
+                          path, entry->name);
+                (void)fclose(file);
+                return -1;
+            }
+            continue;
         }
         if (entry->commit[0] != '\0') {
             /*
@@ -961,16 +989,21 @@ static int load_lockfile(const char *path, ForgeLockFile *lock,
          * downloaded bytes verbatim, so a hand-edited or corrupt pin must
          * fail here rather than fetching whatever the tampered entry says.
          */
-        if (entry->version[0] == '\0' || entry->url[0] == '\0' ||
-            !is_full_sha256(entry->sha256)) {
+        if (entry->version[0] != '\0' && entry->url[0] != '\0' &&
+            is_full_sha256(entry->sha256)) {
             forge_util_set_error(error, error_size,
-                      "%s: dependency '%s' has a malformed registry pin "
-                      "(expected version, url, and 64-hex sha256); delete "
-                      "Forge.lock and run 'forge update' to regenerate it",
+                      "%s: dependency '%s' uses the old registry artifact "
+                      "lock format; regenerate your lockfile with 'forge update'",
                       path, entry->name);
             (void)fclose(file);
             return -1;
         }
+        forge_util_set_error(error, error_size,
+                  "%s: dependency '%s' has a malformed lock pin; delete "
+                  "Forge.lock and run 'forge update' to regenerate it",
+                  path, entry->name);
+        (void)fclose(file);
+        return -1;
     }
     (void)fclose(file);
     return 0;
@@ -1408,12 +1441,9 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
             }
             is_native = dir_has_file(root, "Forge.toml");
         } else if (dependency->registry[0] != '\0') {
-            /*
-             * Registry source: the sunn registry yields a tarball URL plus
-             * a sha256, and from there the dependency behaves exactly like
-             * any other fetched source — unpacked under the shared cache,
-             * pinned in Forge.lock, subject to --offline/--locked.
-             */
+            /* Registry source: Sunn yields a source recipe. Materialization
+             * reuses the ordinary Git checkout primitive for Git recipes and
+             * the ordinary fetch/checksum path for URL recipes. */
             ForgeLockEntry *locked = lock_find(&context->lock, dependency->name);
             char cache_home[FORGE_PATH_MAX];
             char safe_name[FORGE_PATH_MAX];
@@ -1454,8 +1484,11 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                 context->logger, dependency->name, dependency->registry,
                 dependency->registry_version,
                 locked != NULL ? locked->version : "",
+                locked != NULL ? locked->kind : "",
+                locked != NULL ? locked->location : "",
+                locked != NULL ? locked->ref : "",
+                locked != NULL ? locked->commit : "",
                 locked != NULL ? locked->sha256 : "",
-                locked != NULL ? locked->url : "",
                 dep_force, context->offline, package_dir,
                 root, sizeof(root), &pin, &reused,
                 context->error, sizeof(context->error));
@@ -1467,11 +1500,9 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                      dependency->name, pin.version,
                      reused ? " (cached)" : "");
 
-            if (pin.url[0] == '\0') {
-                /* A pin without a URL would fail its own load gate on the
-                 * next run; refuse to write it instead. */
+            if (pin.kind[0] == '\0' || pin.location[0] == '\0') {
                 forge_util_set_error(context->error, sizeof(context->error),
-                          "internal error: registry pin for '%s' has no URL",
+                          "internal error: registry pin for '%s' has no source",
                           dependency->name);
                 return -1;
             }
@@ -1489,14 +1520,18 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                 locked = &context->lock.items[context->lock.count++];
                 (void)snprintf(locked->name, sizeof(locked->name), "%s", dependency->name);
             }
-            if (strcmp(locked->version, pin.version) != 0 ||
-                strcmp(locked->sha256, pin.sha256) != 0 ||
-                strcmp(locked->url, pin.url) != 0) {
+            if (strcmp(locked->kind, pin.kind) != 0 ||
+                strcmp(locked->version, pin.version) != 0 ||
+                strcmp(locked->location, pin.location) != 0 ||
+                strcmp(locked->ref, pin.ref) != 0 ||
+                strcmp(locked->commit, pin.commit) != 0 ||
+                strcmp(locked->sha256, pin.sha256) != 0) {
+                (void)snprintf(locked->kind, sizeof(locked->kind), "%s", pin.kind);
                 (void)snprintf(locked->version, sizeof(locked->version), "%s", pin.version);
+                (void)snprintf(locked->location, sizeof(locked->location), "%s", pin.location);
+                (void)snprintf(locked->ref, sizeof(locked->ref), "%s", pin.ref);
+                (void)snprintf(locked->commit, sizeof(locked->commit), "%s", pin.commit);
                 (void)snprintf(locked->sha256, sizeof(locked->sha256), "%s", pin.sha256);
-                (void)snprintf(locked->url, sizeof(locked->url), "%s", pin.url);
-                locked->commit[0] = '\0';
-                locked->ref[0] = '\0';
                 context->lock_dirty = 1;
             }
             is_native = dir_has_file(root, "Forge.toml");
@@ -1561,7 +1596,7 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                                        sizeof(context->error)) != 0) {
                     return -1;
                 }
-                checkout_status = ensure_git_checkout(
+                checkout_status = forge_deps_ensure_git_checkout(
                     context->logger, dependency->name,
                     dependency->git_url, dependency->ref,
                     locked != NULL &&

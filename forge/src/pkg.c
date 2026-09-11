@@ -379,7 +379,6 @@ static int query_registry_latest(ForgeLogger *logger, const char *package,
     char cache_home[FORGE_PATH_MAX];
     char registry_root[FORGE_PATH_MAX];
     char tmp_path[FORGE_PATH_MAX];
-    char triplet[64];
     ForgeRegistryPin pin;
 
     if (forge_deps_cache_home(cache_home, sizeof(cache_home)) != 0) {
@@ -404,8 +403,7 @@ static int query_registry_latest(ForgeLogger *logger, const char *package,
         forge_util_set_error(error, error_size, "registry cache path is too long");
         return -1;
     }
-    forge_registry_host_triplet(triplet, sizeof(triplet));
-    if (forge_registry_query(logger, package, "", triplet, tmp_path, &pin,
+    if (forge_registry_query(logger, package, "", tmp_path, &pin,
                              error, error_size) != 0) {
         return -1;
     }

@@ -49,7 +49,7 @@ bun run forge:test`}
         </CardHeader>
         <CardContent className="text-sm flex flex-col gap-2">
           <p>
-            <code>GET /api/forge/v1/resolve?name=hello-c&amp;version=0.1.0&amp;triplet=x64-windows</code>
+            <code>GET /api/forge/v1/resolve?name=hello-c&amp;version=0.1.0</code>
           </p>
           <Link href="/packages" className="underline underline-offset-4 w-fit">
             Browse native packages →

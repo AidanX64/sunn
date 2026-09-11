@@ -7,25 +7,20 @@ import {
   packageVersionSchema,
   registryIndexSchema,
   resolvePublicFile,
-  tripletSchema,
 } from "@/lib/sunn-registry"
 
-// GET /api/forge/v1/resolve?name=hello-c&version=0.1.0&triplet=x64-windows
-// Minimal contract for the separate forge CLI: pin name+version to an artifact.
+// GET /api/forge/v1/resolve?name=hello-c&version=0.1.0
+// Resolve a native Forge recipe, not a Sunn-hosted artifact.
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url)
     const name = searchParams.get("name")
     const version = searchParams.get("version")
-    const triplet = searchParams.get("triplet")
     if (!name || !packageNameSchema.safeParse(name).success) {
       return NextResponse.json({ error: "Missing or invalid ?name=" }, { status: 400 })
     }
     if (version !== null && !packageVersionSchema.safeParse(version).success) {
       return NextResponse.json({ error: "Invalid ?version=" }, { status: 400 })
-    }
-    if (triplet !== null && !tripletSchema.safeParse(triplet).success) {
-      return NextResponse.json({ error: "Invalid ?triplet=" }, { status: 400 })
     }
 
     const indexPath = path.join(process.cwd(), "public", "packages", "sunn.registry.json")
@@ -53,16 +48,10 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: "Something went wrong" }, { status: 500 })
     }
 
-    const artifact = triplet
-      ? pkg.artifacts.find((a) => a.triplet === triplet) ?? null
-      : null
-
     return NextResponse.json({
-      name: pkg.name,
       version: pkg.version,
-      triplet: triplet ?? null,
-      artifact,
-      manifest: pkg.forge?.manifest ?? null,
+      source: pkg.source,
+      patches: pkg.patches,
     })
   } catch (error) {
     console.error("Error resolving forge package:", error)

@@ -45,31 +45,379 @@ int forge_registry_base_url(char *base_out, size_t base_size,
     base_out[length] = '\0';
     return 0;
 }
-
-void forge_registry_host_triplet(char *triplet_out, size_t triplet_size)
+static void registry_identity(const ForgeRegistryPin *pin, char *out,
+                              size_t out_size)
 {
-#if defined(_M_ARM64) || defined(__aarch64__)
-    const char *arch = "aarch64";
-    const char *label = "arm64";
-#elif defined(_M_X64) || defined(__x86_64__) || defined(_M_AMD64)
-    const char *arch = "x86_64";
-    const char *label = "x64";
-#else
-    const char *arch = "unknown";
-    const char *label = "unknown";
-#endif
-#if FORGE_PLATFORM_WINDOWS
-    const char *os = "windows";
-#elif defined(__APPLE__)
-    const char *os = "macos";
-#elif defined(__linux__)
-    const char *os = "linux";
-#else
-    const char *os = "unknown";
-#endif
+    size_t used = (size_t)snprintf(out, out_size, "%s|%s|%s|%s|%s|",
+                                   pin->kind, pin->location, pin->ref,
+                                   pin->commit, pin->sha256);
+    for (size_t index = 0U; index < pin->patch_count && used < out_size; ++index) {
+        int written = snprintf(out + used, out_size - used, "%s|",
+                                pin->patches[index]);
+        if (written < 0 || (size_t)written >= out_size - used) break;
+        used += (size_t)written;
+    }
+}
 
-    (void)arch;
-    (void)snprintf(triplet_out, triplet_size, "%s-%s", label, os);
+static int recipe_directory_has_source(const char *directory)
+{
+    static const char *const markers[] = {
+        "Forge.toml", "CMakeLists.txt", "Makefile", "makefile", "GNUmakefile"
+    };
+    char path[FORGE_PATH_MAX];
+    for (size_t index = 0U; index < sizeof(markers) / sizeof(markers[0]); ++index) {
+        if (snprintf(path, sizeof(path), "%s/%s", directory, markers[index]) >= 0) {
+            FILE *file = fopen(path, "rb");
+            if (file != NULL) {
+                (void)fclose(file);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void recipe_read_marker(const char *directory, char *out, size_t out_size)
+{
+    char path[FORGE_PATH_MAX];
+    FILE *file;
+    size_t length;
+    out[0] = '\0';
+    if (snprintf(path, sizeof(path), "%s/.forge-pin-sha256", directory) < 0) return;
+    file = fopen(path, "rb");
+    if (file == NULL) return;
+    length = fread(out, 1U, out_size - 1U, file);
+    (void)fclose(file);
+    out[length] = '\0';
+    out[strcspn(out, "\r\n")] = '\0';
+}
+
+static int recipe_write_marker(const char *directory, const char *value,
+                               char *error, size_t error_size)
+{
+    char path[FORGE_PATH_MAX];
+    FILE *file;
+    if (snprintf(path, sizeof(path), "%s/.forge-pin-sha256", directory) < 0) {
+        forge_util_set_error(error, error_size, "registry cache path is too long");
+        return -1;
+    }
+    file = fopen(path, "wb");
+    if (file == NULL || fputs(value, file) < 0 || fputc('\n', file) == EOF ||
+        fclose(file) != 0) {
+        if (file != NULL) (void)fclose(file);
+        forge_util_set_error(error, error_size, "cannot record registry source pin");
+        return -1;
+    }
+    return 0;
+}
+
+static int package_name_is_portable(const char *name);
+
+static void registry_cache_hash(const char *text, char *hex, size_t hex_size)
+{
+    unsigned long long hash = 1469598103934665603ULL;
+    for (const unsigned char *cursor = (const unsigned char *)text;
+         *cursor != 0U; ++cursor) {
+        hash ^= *cursor;
+        hash *= 1099511628211ULL;
+    }
+    (void)snprintf(hex, hex_size, "%016llx", hash);
+}
+
+static int apply_registry_patches(ForgeLogger *logger, const char *base,
+                                  const ForgeRegistryPin *pin,
+                                  const char *root, const char *patch_dir,
+                                  char *error, size_t error_size)
+{
+    for (size_t index = 0U; index < pin->patch_count; ++index) {
+        char url[FORGE_PATH_MAX];
+        char patch_path[FORGE_PATH_MAX];
+        ForgeArgv argv = { 0 };
+        int exit_code = 0;
+
+        if (snprintf(url, sizeof(url), "%s/patches/%s", base,
+                     pin->patches[index]) < 0 ||
+            strlen(base) + strlen(pin->patches[index]) + 9U >= sizeof(url) ||
+            snprintf(patch_path, sizeof(patch_path), "%s/%s", patch_dir,
+                     pin->patches[index]) < 0 ||
+            strlen(patch_dir) + strlen(pin->patches[index]) + 1U >=
+                sizeof(patch_path)) {
+            forge_util_set_error(error, error_size, "registry patch path is too long");
+            return -1;
+        }
+        if (forge_fetch_url_is_supported(url, error, error_size) != 0 ||
+            forge_fetch_to_file(logger, url, patch_path, error, error_size) != 0) {
+            return -1;
+        }
+        if (forge_argv_append(&argv, "git") != 0 ||
+            forge_argv_append(&argv, "-C") != 0 ||
+            forge_argv_append(&argv, root) != 0 ||
+            forge_argv_append(&argv, "apply") != 0 ||
+            forge_argv_append(&argv, "--check") != 0 ||
+            forge_argv_append(&argv, "--") != 0 ||
+            forge_argv_append(&argv, patch_path) != 0 ||
+            forge_argv_finalize(&argv) != 0 ||
+            forge_process_run(argv.items, NULL, 0, &exit_code,
+                              error, error_size) != 0 || exit_code != 0) {
+            forge_argv_free(&argv);
+            forge_util_set_error(error, error_size,
+                      "registry patch '%s' does not apply to '%s'",
+                      pin->patches[index], root);
+            return -1;
+        }
+        forge_argv_free(&argv);
+        {
+            ForgeArgv apply = { 0 };
+            if (forge_argv_append(&apply, "git") != 0 ||
+                forge_argv_append(&apply, "-C") != 0 ||
+                forge_argv_append(&apply, root) != 0 ||
+                forge_argv_append(&apply, "apply") != 0 ||
+                forge_argv_append(&apply, "--") != 0 ||
+                forge_argv_append(&apply, patch_path) != 0 ||
+                forge_argv_finalize(&apply) != 0 ||
+                forge_process_run(apply.items, NULL, 0, &exit_code,
+                                  error, error_size) != 0 || exit_code != 0) {
+                forge_argv_free(&apply);
+                forge_util_set_error(error, error_size,
+                          "could not apply registry patch '%s'",
+                          pin->patches[index]);
+                return -1;
+            }
+            forge_argv_free(&apply);
+        }
+    }
+    return 0;
+}
+
+int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
+                               const char *package,
+                               const char *wanted_version,
+                               const char *lock_version, const char *lock_kind,
+                               const char *lock_location, const char *lock_ref,
+                               const char *lock_commit, const char *lock_sha256,
+                               int force_update, int offline,
+                               const char *package_dir,
+                               char *root_out, size_t root_size,
+                               ForgeRegistryPin *pin, int *reused,
+                               char *error, size_t error_size)
+{
+    char base[FORGE_PATH_MAX];
+    char version[FORGE_MANIFEST_VALUE_MAX];
+    char safe[FORGE_PATH_MAX];
+    char version_dir[FORGE_PATH_MAX];
+    char resolve_tmp[FORGE_PATH_MAX];
+    char marker[FORGE_PATH_MAX * 2U];
+    char identity[FORGE_PATH_MAX * 2U];
+    int query_latest;
+
+    if (pin == NULL || reused == NULL) {
+        forge_util_set_error(error, error_size, "registry materialize needs a pin");
+        return -1;
+    }
+    memset(pin, 0, sizeof(*pin));
+    *reused = 0;
+    if (forge_registry_base_url(base, sizeof(base), error, error_size) != 0 ||
+        !package_name_is_portable(package)) {
+        forge_util_set_error(error, error_size, "invalid registry package name '%s'",
+                             package != NULL ? package : "<null>");
+        return -1;
+    }
+    query_latest = wanted_version == NULL || wanted_version[0] == '\0';
+    if (!query_latest) {
+        (void)snprintf(version, sizeof(version), "%s", wanted_version);
+    } else if (lock_version != NULL && lock_version[0] != '\0' && !force_update) {
+        (void)snprintf(version, sizeof(version), "%s", lock_version);
+    } else {
+        version[0] = '\0';
+    }
+    if (version[0] != '\0') {
+        forge_paths_safe_output_name(version, safe, sizeof(safe));
+        if (lock_kind != NULL && strcmp(lock_kind, "git") == 0 &&
+            lock_location != NULL && lock_location[0] != '\0') {
+            char cache_hash[32];
+            registry_cache_hash(lock_location, cache_hash, sizeof(cache_hash));
+            if (strlen(package_dir) + strlen(safe) + strlen(cache_hash) + 2U >=
+                sizeof(version_dir)) {
+                forge_util_set_error(error, error_size, "registry cache path is too long");
+                return -1;
+            }
+            {
+                size_t base_length = strlen(package_dir);
+                size_t name_length = strlen(safe);
+                memcpy(version_dir, package_dir, base_length);
+                version_dir[base_length] = '/';
+                memcpy(version_dir + base_length + 1U, safe, name_length);
+                version_dir[base_length + 1U + name_length] = '-';
+                memcpy(version_dir + base_length + 2U + name_length,
+                       cache_hash, strlen(cache_hash) + 1U);
+            }
+        } else {
+        if (strlen(package_dir) + strlen(safe) + 1U >= sizeof(version_dir)) {
+            forge_util_set_error(error, error_size, "registry cache path is too long");
+            return -1;
+        }
+        {
+            size_t base_length = strlen(package_dir);
+            size_t name_length = strlen(safe);
+            memcpy(version_dir, package_dir, base_length);
+            version_dir[base_length] = '/';
+            memcpy(version_dir + base_length + 1U, safe, name_length + 1U);
+        }
+        }
+    } else {
+        version_dir[0] = '\0';
+    }
+    (void)snprintf(resolve_tmp, sizeof(resolve_tmp), "%s/.resolve.json.tmp",
+                   package_dir);
+
+    if (version_dir[0] != '\0' && lock_kind != NULL && lock_kind[0] != '\0') {
+        ForgeRegistryPin locked = { 0 };
+        (void)snprintf(locked.version, sizeof(locked.version), "%s", lock_version);
+        (void)snprintf(locked.kind, sizeof(locked.kind), "%s", lock_kind);
+        (void)snprintf(locked.location, sizeof(locked.location), "%s", lock_location);
+        (void)snprintf(locked.ref, sizeof(locked.ref), "%s", lock_ref);
+        (void)snprintf(locked.commit, sizeof(locked.commit), "%s", lock_commit);
+        (void)snprintf(locked.sha256, sizeof(locked.sha256), "%s", lock_sha256);
+        registry_identity(&locked, identity, sizeof(identity));
+        recipe_read_marker(version_dir, marker, sizeof(marker));
+        if (!force_update && strcmp(identity, marker) == 0 &&
+            recipe_directory_has_source(version_dir)) {
+            (void)snprintf(pin->version, sizeof(pin->version), "%s", locked.version);
+            (void)snprintf(pin->kind, sizeof(pin->kind), "%s", locked.kind);
+            (void)snprintf(pin->location, sizeof(pin->location), "%s", locked.location);
+            (void)snprintf(pin->ref, sizeof(pin->ref), "%s", locked.ref);
+            (void)snprintf(pin->commit, sizeof(pin->commit), "%s", locked.commit);
+            (void)snprintf(pin->sha256, sizeof(pin->sha256), "%s", locked.sha256);
+            (void)snprintf(root_out, root_size, "%s", version_dir);
+            *reused = 1;
+            return 0;
+        }
+    }
+    if (offline) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s' is not cached and --offline forbids fetching it",
+                  dep_name != NULL ? dep_name : package);
+        return -1;
+    }
+    if (forge_registry_query(logger, package, version, resolve_tmp, pin,
+                             error, error_size) != 0) return -1;
+    if (lock_version != NULL && lock_version[0] != '\0' &&
+        strcmp(pin->version, lock_version) == 0 &&
+        ((lock_kind != NULL && strcmp(pin->kind, lock_kind) != 0) ||
+         (lock_location != NULL && strcmp(pin->location, lock_location) != 0) ||
+         (lock_ref != NULL && strcmp(pin->ref, lock_ref) != 0) ||
+         (lock_sha256 != NULL && strcmp(pin->sha256, lock_sha256) != 0))) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s': registry recipe changed under Forge.lock; "
+                  "run 'forge update' to regenerate it", dep_name);
+        return -1;
+    }
+    forge_paths_safe_output_name(pin->version, safe, sizeof(safe));
+    if (strcmp(pin->kind, "git") != 0) {
+        if (strlen(package_dir) + strlen(safe) + 1U >= sizeof(version_dir)) {
+            forge_util_set_error(error, error_size, "registry cache path is too long");
+            return -1;
+        }
+        {
+            size_t base_length = strlen(package_dir);
+            size_t name_length = strlen(safe);
+            memcpy(version_dir, package_dir, base_length);
+            version_dir[base_length] = '/';
+            memcpy(version_dir + base_length + 1U, safe, name_length + 1U);
+        }
+    }
+    registry_identity(pin, identity, sizeof(identity));
+    recipe_read_marker(version_dir, marker, sizeof(marker));
+    if (!force_update && strcmp(identity, marker) == 0 &&
+        recipe_directory_has_source(version_dir)) {
+        (void)snprintf(root_out, root_size, "%s", version_dir);
+        *reused = 1;
+        return 0;
+    }
+    forge_paths_remove_tree(version_dir, NULL, 0U);
+    if (strcmp(pin->kind, "git") == 0) {
+        char resolved[FORGE_MANIFEST_VALUE_MAX];
+        char cache_hash[32];
+        (void)registry_cache_hash(pin->location, cache_hash, sizeof(cache_hash));
+        if (strlen(package_dir) + strlen(safe) + strlen(cache_hash) + 2U >=
+            sizeof(version_dir)) {
+            forge_util_set_error(error, error_size, "registry cache path is too long");
+            return -1;
+        }
+        {
+            size_t base_length = strlen(package_dir);
+            size_t name_length = strlen(safe);
+            size_t hash_length = strlen(cache_hash);
+            memcpy(version_dir, package_dir, base_length);
+            version_dir[base_length] = '/';
+            memcpy(version_dir + base_length + 1U, safe, name_length);
+            version_dir[base_length + 1U + name_length] = '-';
+            memcpy(version_dir + base_length + 2U + name_length,
+                   cache_hash, hash_length + 1U);
+        }
+        forge_paths_remove_tree(version_dir, NULL, 0U);
+        if (forge_paths_ensure_directory(package_dir, error, error_size) != 0 ||
+            forge_deps_ensure_git_checkout(logger, dep_name, pin->location,
+                pin->ref, lock_kind != NULL && strcmp(lock_kind, "git") == 0 ?
+                lock_commit : "", force_update, 0, offline, version_dir,
+                resolved, sizeof(resolved), error, error_size) != 0) return -1;
+        (void)snprintf(pin->commit, sizeof(pin->commit), "%s", resolved);
+    } else {
+        char archive[FORGE_PATH_MAX];
+        char actual[FORGE_SHA256_HEX_LENGTH + 1U];
+        if (strlen(package_dir) + strlen(safe) + 11U >= sizeof(archive)) {
+            forge_util_set_error(error, error_size, "registry cache path is too long");
+            return -1;
+        }
+        {
+            size_t base_length = strlen(package_dir);
+            size_t name_length = strlen(safe);
+            memcpy(archive, package_dir, base_length);
+            archive[base_length] = '/';
+            archive[base_length + 1U] = '.';
+            memcpy(archive + base_length + 2U, safe, name_length);
+            memcpy(archive + base_length + 2U + name_length,
+                   ".tgz.tmp", 9U);
+        }
+        if (forge_fetch_to_file(logger, pin->location, archive, error, error_size) != 0 ||
+            forge_sha256_file(archive, actual, error, error_size) != 0) {
+            (void)remove(archive);
+            return -1;
+        }
+        if (strcmp(actual, pin->sha256) != 0) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': source sha256 does not match recipe",
+                      package);
+            (void)remove(archive);
+            return -1;
+        }
+        if (forge_fetch_unpack_tar_gz(logger, archive, version_dir, error,
+                                      error_size) != 0) {
+            (void)remove(archive);
+            return -1;
+        }
+        (void)remove(archive);
+    }
+    {
+        char patch_dir[FORGE_PATH_MAX];
+        if (snprintf(patch_dir, sizeof(patch_dir), "%s/.patches", version_dir) < 0 ||
+            forge_paths_ensure_directory(patch_dir, error, error_size) != 0 ||
+            apply_registry_patches(logger, base, pin, version_dir, patch_dir,
+                                   error, error_size) != 0) return -1;
+    }
+    if (!recipe_directory_has_source(version_dir)) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s' has no buildable source after registry patches",
+                  package);
+        return -1;
+    }
+    registry_identity(pin, identity, sizeof(identity));
+    if (recipe_write_marker(version_dir, identity, error, error_size) != 0 ||
+        (size_t)snprintf(root_out, root_size, "%s", version_dir) >= root_size) {
+        forge_util_set_error(error, error_size, "registry cache path is too long");
+        return -1;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -424,8 +772,136 @@ static int json_object_string(ForgeJsonCursor *cursor, const char *wanted,
     }
 }
 
+static int json_array_strings(const char *json, const char *wanted,
+                              char values[][FORGE_PATH_MAX], size_t capacity,
+                              size_t *count)
+{
+    ForgeJsonCursor cursor = { json, NULL };
+    int first = 1;
+
+    *count = 0U;
+    json_skip_space(&cursor);
+    if (*cursor.text != '{') return -1;
+    ++cursor.text;
+    for (;;) {
+        char key[128];
+        json_skip_space(&cursor);
+        if (*cursor.text == '}') return 0;
+        if (!first) {
+            if (*cursor.text != ',') return -1;
+            ++cursor.text;
+            json_skip_space(&cursor);
+        }
+        first = 0;
+        if (json_read_string(&cursor, key, sizeof(key)) != 0) return -1;
+        json_skip_space(&cursor);
+        if (*cursor.text != ':') return -1;
+        ++cursor.text;
+        json_skip_space(&cursor);
+        if (strcmp(key, wanted) != 0) {
+            if (json_skip_value(&cursor) != 0) return -1;
+            continue;
+        }
+        if (*cursor.text != '[') return -1;
+        ++cursor.text;
+        for (;;) {
+            json_skip_space(&cursor);
+            if (*cursor.text == ']') return 0;
+            if (*count == capacity || json_read_string(&cursor,
+                    values[*count], FORGE_PATH_MAX) != 0) return -1;
+            ++*count;
+            json_skip_space(&cursor);
+            if (*cursor.text == ',') {
+                ++cursor.text;
+                continue;
+            }
+            if (*cursor.text == ']') return 0;
+            return -1;
+        }
+    }
+}
+
+static int parse_recipe(const char *body, const char *base,
+                        ForgeRegistryPin *pin, char *error, size_t error_size)
+{
+    char value[FORGE_PATH_MAX];
+    char absolute[FORGE_PATH_MAX];
+    int is_null = 0;
+    int found;
+
+    found = json_object_string(&(ForgeJsonCursor){ body, NULL }, "version",
+                               pin->version, sizeof(pin->version), &is_null);
+    if (found <= 0 || is_null || !version_text_is_valid(pin->version)) {
+        forge_util_set_error(error, error_size, "registry response has no usable version");
+        return -1;
+    }
+    found = json_nested_string(body, "source", "kind", pin->kind,
+                               sizeof(pin->kind), &is_null);
+    if (found <= 0 || is_null ||
+        (strcmp(pin->kind, "git") != 0 && strcmp(pin->kind, "url") != 0)) {
+        forge_util_set_error(error, error_size,
+                  "registry response has no supported source kind");
+        return -1;
+    }
+    found = json_nested_string(body, "source", "location", value,
+                               sizeof(value), &is_null);
+    if (found <= 0 || is_null || value[0] == '\0') {
+        forge_util_set_error(error, error_size, "registry response has no source location");
+        return -1;
+    }
+    if (value[0] == '/' && value[1] != '/') {
+        if (snprintf(absolute, sizeof(absolute), "%s%s", base, value) < 0 ||
+            strlen(base) + strlen(value) >= sizeof(absolute)) {
+            forge_util_set_error(error, error_size, "registry source location is too long");
+            return -1;
+        }
+    } else {
+        if (snprintf(absolute, sizeof(absolute), "%s", value) < 0 ||
+            strlen(value) >= sizeof(absolute)) {
+            forge_util_set_error(error, error_size, "registry source location is too long");
+            return -1;
+        }
+    }
+    if (strcmp(pin->kind, "git") == 0) {
+        found = json_nested_string(body, "source", "ref", pin->ref,
+                                   sizeof(pin->ref), &is_null);
+        if (found <= 0 || is_null || pin->ref[0] == '\0') {
+            forge_util_set_error(error, error_size,
+                      "registry Git source must have a supported location and ref");
+            return -1;
+        }
+        if (forge_deps_git_url_is_supported(absolute, error, error_size) != 0) return -1;
+    } else {
+        found = json_nested_string(body, "source", "sha256", pin->sha256,
+                                   sizeof(pin->sha256), &is_null);
+        if (found <= 0 || is_null || !sha256_text_is_valid(pin->sha256)) {
+            forge_util_set_error(error, error_size,
+                      "registry URL source must have a supported location and sha256");
+            return -1;
+        }
+        if (forge_fetch_url_is_supported(absolute, error, error_size) != 0) return -1;
+    }
+    (void)snprintf(pin->location, sizeof(pin->location), "%s", absolute);
+    if (json_array_strings(body, "patches", pin->patches,
+                           FORGE_REGISTRY_MAX_PATCHES, &pin->patch_count) < 0) {
+        forge_util_set_error(error, error_size,
+                  "registry response has an invalid patches array");
+        return -1;
+    }
+    for (size_t index = 0U; index < pin->patch_count; ++index) {
+        const char *name = pin->patches[index];
+        if (name[0] == '\0' || strchr(name, '/') != NULL ||
+            strchr(name, '\\') != NULL || strstr(name, "..") != NULL) {
+            forge_util_set_error(error, error_size,
+                      "registry response has an unsafe patch name");
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
-/* Array selection (file-layout registries list per-triplet artifacts) */
+/* Array selection (legacy helper retained for static registry indexes) */
 /* ------------------------------------------------------------------ */
 
 /*
@@ -555,7 +1031,7 @@ static int json_array_select(const char *json, const char *array_key,
 /* ------------------------------------------------------------------ */
 
 static int query_file_registry(const char *base, const char *package,
-                               const char *version, const char *triplet,
+                               const char *version,
                                ForgeRegistryPin *pin,
                                char *error, size_t error_size)
 {
@@ -655,57 +1131,7 @@ static int query_file_registry(const char *base, const char *package,
         return -1;
     }
     {
-        char file_version[FORGE_MANIFEST_VALUE_MAX];
-        char url[FORGE_PATH_MAX];
-        char absolute[FORGE_PATH_MAX];
-        int is_null = 0;
-
-        found = json_object_string(&(ForgeJsonCursor){ body, NULL }, "version",
-                                   file_version, sizeof(file_version),
-                                   &is_null);
-        if (found <= 0 || is_null || !version_text_is_valid(file_version)) {
-            forge_util_set_error(error, error_size,
-                      "registry file '%s' has no usable version", path);
-            return -1;
-        }
-        found = json_array_select(body, "artifacts", "triplet", triplet,
-                                  "url", url, sizeof(url),
-                                  "sha256", pin->sha256,
-                                  sizeof(pin->sha256));
-        if (found < 0) {
-            forge_util_set_error(error, error_size,
-                      "registry file '%s' is not valid JSON", path);
-            return -1;
-        }
-        if (found == 0) {
-            forge_util_set_error(error, error_size,
-                      "registry has no '%s' build for triplet '%s'", package,
-                      triplet);
-            return -1;
-        }
-        if (!sha256_text_is_valid(pin->sha256)) {
-            forge_util_set_error(error, error_size,
-                      "registry file '%s' has no usable sha256", path);
-            return -1;
-        }
-        if (url[0] == '/' && url[1] != '/') {
-            if (snprintf(absolute, sizeof(absolute), "%s%s", base, url) < 0 ||
-                strlen(base) + strlen(url) >= sizeof(absolute)) {
-                forge_util_set_error(error, error_size, "registry artifact URL is too long");
-                return -1;
-            }
-        } else {
-            if (snprintf(absolute, sizeof(absolute), "%s", url) < 0 ||
-                strlen(url) >= sizeof(absolute)) {
-                forge_util_set_error(error, error_size, "registry artifact URL is too long");
-                return -1;
-            }
-        }
-        if (forge_fetch_url_is_supported(absolute, error, error_size) != 0) {
-            return -1;
-        }
-        (void)snprintf(pin->version, sizeof(pin->version), "%s", file_version);
-        (void)snprintf(pin->url, sizeof(pin->url), "%s", absolute);
+        if (parse_recipe(body, base, pin, error, error_size) != 0) return -1;
     }
     return 0;
 }
@@ -748,15 +1174,14 @@ static int read_response_file(const char *path, char *body, size_t body_size,
 }
 
 int forge_registry_query(ForgeLogger *logger, const char *package,
-                         const char *version, const char *triplet,
-                         const char *tmp_path, ForgeRegistryPin *pin,
+                         const char *version, const char *tmp_path,
+                         ForgeRegistryPin *pin,
                          char *error, size_t error_size)
 {
     char base[FORGE_PATH_MAX];
     char url[FORGE_PATH_MAX * 2U];
     char body[65536];
     char value[FORGE_PATH_MAX];
-    char absolute[FORGE_PATH_MAX];
     int is_null = 0;
     int found;
 
@@ -781,15 +1206,11 @@ int forge_registry_query(ForgeLogger *logger, const char *package,
     if (forge_registry_base_url(base, sizeof(base), error, error_size) != 0) {
         return -1;
     }
-    if (triplet == NULL || triplet[0] == '\0') {
-        forge_util_set_error(error, error_size, "registry query needs a triplet");
-        return -1;
-    }
     if (strncmp(base, "file://", 7U) == 0) {
         /* Static layout: no query strings exist for files. */
         (void)logger;
         (void)tmp_path;
-        return query_file_registry(base, package, version, triplet, pin,
+        return query_file_registry(base, package, version, pin,
                                    error, error_size);
     }
     /* snprintf truncations are detected via the would-be length: a silently
@@ -799,12 +1220,12 @@ int forge_registry_query(ForgeLogger *logger, const char *package,
 
         if (version != NULL && version[0] != '\0') {
             written = snprintf(url, sizeof(url),
-                               "%s/api/forge/v1/resolve?name=%s&version=%s&triplet=%s",
-                               base, package, version, triplet);
+                               "%s/api/forge/v1/resolve?name=%s&version=%s",
+                               base, package, version);
         } else {
             written = snprintf(url, sizeof(url),
-                               "%s/api/forge/v1/resolve?name=%s&triplet=%s",
-                               base, package, triplet);
+                               "%s/api/forge/v1/resolve?name=%s",
+                               base, package);
         }
         if (written < 0 || (size_t)written >= sizeof(url)) {
             forge_util_set_error(error, error_size, "registry query URL is too long");
@@ -843,48 +1264,9 @@ int forge_registry_query(ForgeLogger *logger, const char *package,
                   "registry response for '%s' has no usable version", package);
         return -1;
     }
-    found = json_nested_string(body, "artifact", "url", value, sizeof(value),
-                               &is_null);
-    if (found < 0) {
-        forge_util_set_error(error, error_size,
-                  "registry response for '%s' is not valid JSON", package);
-        return -1;
-    }
-    if (found == 0 || is_null || value[0] == '\0') {
-        forge_util_set_error(error, error_size,
-                  "registry has no '%s' build for triplet '%s'", package,
-                  triplet);
-        return -1;
-    }
-    /* Artifact URLs are either absolute https (CDN) or registry-relative
-     * (our static hosting, "/packages/..."); join the latter onto base. */
-    if (value[0] == '/' && value[1] != '/') {
-        if (snprintf(absolute, sizeof(absolute), "%s%s", base, value) < 0 ||
-            strlen(base) + strlen(value) >= sizeof(absolute)) {
-            forge_util_set_error(error, error_size, "registry artifact URL is too long");
-            return -1;
-        }
-    } else {
-        if (snprintf(absolute, sizeof(absolute), "%s", value) < 0 ||
-            strlen(value) >= sizeof(absolute)) {
-            forge_util_set_error(error, error_size, "registry artifact URL is too long");
-            return -1;
-        }
-    }
-    if (forge_fetch_url_is_supported(absolute, error, error_size) != 0) {
-        return -1;
-    }
-    (void)snprintf(pin->url, sizeof(pin->url), "%s", absolute);
-    found = json_nested_string(body, "artifact", "sha256", pin->sha256,
-                               sizeof(pin->sha256), &is_null);
-    if (found < 0) {
-        forge_util_set_error(error, error_size,
-                  "registry response for '%s' is not valid JSON", package);
-        return -1;
-    }
-    if (found == 0 || is_null || !sha256_text_is_valid(pin->sha256)) {
-        forge_util_set_error(error, error_size,
-                  "registry response for '%s' has no usable sha256", package);
+    if (parse_recipe(body, base, pin, error, error_size) != 0) {
+        forge_util_prepend_error(error, error_size,
+                                 "registry response for '%s': ", package);
         return -1;
     }
     return 0;
@@ -894,6 +1276,7 @@ int forge_registry_query(ForgeLogger *logger, const char *package,
 /* Materialize: reuse-or-fetch into the shared cache                   */
 /* ------------------------------------------------------------------ */
 
+#if 0
 /* True when `directory` already holds an unpacked dependency source. */
 static int directory_has_source(const char *directory)
 {
@@ -964,7 +1347,9 @@ static int write_pin_marker(const char *version_dir, const char *sha,
     }
     return 0;
 }
+#endif
 
+#if 0
 int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
                                const char *package,
                                const char *wanted_version,
@@ -1171,3 +1556,4 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
     }
     return 0;
 }
+#endif

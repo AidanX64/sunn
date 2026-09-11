@@ -21,13 +21,12 @@ async function loadPackage(indexPath: string) {
   return nativePackageSchema.parse(JSON.parse(raw))
 }
 
-// GET /api/packages?q=&lang=c&triplet=x64-windows
+// GET /api/packages?q=&lang=c
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url)
     const q = (searchParams.get("q") ?? "").toLowerCase()
     const lang = searchParams.get("lang")
-    const triplet = searchParams.get("triplet")
 
     const index = await loadIndex()
     // One corrupt package must not take down the whole catalog.
@@ -41,7 +40,6 @@ export async function GET(request: Request) {
     const filtered = pkgs.filter((p) => {
       if (q && !`${p.name} ${p.description}`.toLowerCase().includes(q)) return false
       if (lang && p.lang !== lang) return false
-      if (triplet && !p.triplets.includes(triplet)) return false
       return true
     })
 

@@ -314,24 +314,26 @@ names, listing the dependencies that do exist.
 
 ### Registry dependencies
 
-Next to VCS sources, forge resolves versioned tarballs from a sunn
-registry (`FORGE_REGISTRY_URL`, e.g. `https://sunn.local`):
+Next to VCS sources, forge resolves source recipes from a sunn registry
+(`FORGE_REGISTRY_URL`, e.g. `https://sunn.local`):
 
 ```toml
 [dependencies]
 hello = { registry = "hello-c", version = "0.1.0" }
 ```
 
-- The registry maps `name@version` (+ your host triplet) to a tarball URL
-  and sha256. Tarballs land in the shared cache (`~/.forge/registry`,
-  same `FORGE_HOME` override) and the pin in `Forge.lock` records all
-  three — `hello = { version = "0.1.0", sha256 = "<64 hex>", url = "..." }`.
+- The registry maps `name@version` to either an upstream Git repository and
+  ref, or a source archive URL and required sha256. Git recipes are checked
+  out through the same shared Git cache as plain Git dependencies; URL
+  recipes are verified before extraction. Registry pins use an explicit
+  source kind in `Forge.lock`.
   A versioned entry never moves under `forge update` (only the manifest
   moves it); an unversioned `registry = "name"` entry tracks the newest
   release instead.
-- Every download is checksum-verified before unpacking, and a registry
-  whose bytes changed under a locked version fails loudly instead of
-  following. `--offline` reuses warm checkouts only; `--locked` refuses
+- Every URL download is checksum-verified before unpacking. Optional registry
+  patches are fetched from `<registry>/patches/<name>` and applied before
+  build-system detection. A recipe changed under a locked version fails
+  loudly instead of following. `--offline` reuses warm checkouts only; `--locked` refuses
   any pin move — the same contract as git deps.
 - Transports mirror the git allowlist: `https://` always, `http://` only
   for loopback, `file://` only with `FORGE_ALLOW_UNSAFE_REGISTRY=1`

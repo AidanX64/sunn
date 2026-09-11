@@ -60,6 +60,15 @@ typedef struct ForgeDepGraph {
  */
 int forge_deps_git_url_is_supported(const char *url, char *error, size_t error_size);
 
+/* Shared Git materialization primitive used by plain and registry sources. */
+int forge_deps_ensure_git_checkout(ForgeLogger *logger, const char *name,
+                                   const char *url, const char *ref,
+                                   const char *locked_commit, int force_update,
+                                   int submodules, int offline,
+                                   const char *cache_dir, char *resolved_sha,
+                                   size_t resolved_sha_size, char *error,
+                                   size_t error_size);
+
 /*
  * Resolves the manifest's [dependencies] transitively: fetches git deps into
  * the shared cache (~/.forge/git), checks out locked commits, records them in

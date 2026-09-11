@@ -71,7 +71,7 @@ jobs:
           curl -fsS http://localhost:3100/ > /dev/null
           curl -fsS http://localhost:3100/packages > /dev/null
           curl -fsS "http://localhost:3100/api/packages?q=hello-c" > /dev/null
-          curl -fsS "http://localhost:3100/api/forge/v1/resolve?name=hello-c&version=0.1.0&triplet=x64-windows" > /dev/null
+          curl -fsS "http://localhost:3100/api/forge/v1/resolve?name=hello-c&version=0.1.0" > /dev/null
           curl -fsS http://localhost:3100/registry/hello-world > /dev/null
 
   forge:

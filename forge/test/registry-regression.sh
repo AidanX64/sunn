@@ -4,7 +4,7 @@
 #
 #   R1  `forge add NAME --registry PKG --version VER` writes a pinned
 #       manifest entry, downloads + verifies + unpacks the tarball, pins
-#       {version, sha256, url} in Forge.lock, and the dep builds + links.
+#       {kind, version, location, sha256} in Forge.lock, and the dep builds.
 #   R2  omitting --version tracks the newest release (still pinned).
 #   R3  warm cache is offline-friendly; a cold cache + --offline fails
 #       naming the dependency.
@@ -140,13 +140,9 @@ EOF
   "homepage": "https://example.com/$name",
   "lang": "c",
   "build": "forge",
-  "triplets": ["x64-windows", "x64-linux", "arm64-macos"],
   "dependencies": [],
-  "artifacts": [
-    {"triplet": "x64-windows", "url": "/packages/$name/$name-$version.tar.gz", "sha256": "$sha"},
-    {"triplet": "x64-linux", "url": "/packages/$name/$name-$version.tar.gz", "sha256": "$sha"},
-    {"triplet": "arm64-macos", "url": "/packages/$name/$name-$version.tar.gz", "sha256": "$sha"}
-  ],
+  "source": {"kind": "url", "location": "/packages/$name/$name-$version.tar.gz", "sha256": "$sha"},
+  "patches": [],
   "forge": {"manifest": "/packages/$name/Forge.toml"}
 }
 EOF
@@ -222,7 +218,7 @@ int main(void) { printf("%d\n", hello_c_value()); return hello_c_value(); }'
     || fail "R1: add --registry failed"
 grep -q 'greeting = { registry = "hello_c", version = "0.1.0" }' "$work/c1/Forge.toml" \
     || fail "R1: manifest entry not pinned"
-grep -q "greeting = .*version = \"0.1.0\", sha256 = \"$sha010\"" "$work/c1/Forge.lock" \
+grep -q "greeting = .*kind = \"url\".*version = \"0.1.0\".*sha256 = \"$sha010\"" "$work/c1/Forge.lock" \
     || fail "R1: lock pin missing/wrong"
 (cd "$work/c1" && "$FORGE" run >/dev/null 2>&1); code=$?
 [ "$code" -eq 42 ] || fail "R1: run exited $code, want 42 (dep link broken?)"

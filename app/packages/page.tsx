@@ -16,7 +16,6 @@ import type { NativePackage } from "@/lib/sunn-registry"
 export default function PackagesPage() {
   const [q, setQ] = React.useState("")
   const [lang, setLang] = React.useState("")
-  const [triplet, setTriplet] = React.useState("")
   const [pkgs, setPkgs] = React.useState<NativePackage[]>([])
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState("")
@@ -28,7 +27,6 @@ export default function PackagesPage() {
       const params = new URLSearchParams()
       if (q) params.set("q", q)
       if (lang) params.set("lang", lang)
-      if (triplet) params.set("triplet", triplet)
       const res = await fetch(`/api/packages?${params.toString()}`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
@@ -38,7 +36,7 @@ export default function PackagesPage() {
     } finally {
       setLoading(false)
     }
-  }, [q, lang, triplet])
+  }, [q, lang])
 
   React.useEffect(() => {
     void load()
@@ -71,11 +69,6 @@ export default function PackagesPage() {
           <option value="c++">c++</option>
           <option value="asm">asm</option>
         </select>
-        <Input
-          placeholder="triplet (e.g. x64-linux)"
-          value={triplet}
-          onChange={(e) => setTriplet(e.target.value)}
-        />
         <Button onClick={() => void load()}>Search</Button>
       </div>
 
@@ -104,7 +97,7 @@ export default function PackagesPage() {
               <span>·</span>
               <span>license: {p.license || "—"}</span>
               <span>·</span>
-              <span>triplets: {p.triplets.join(", ") || "—"}</span>
+              <span>source: {p.source.kind}</span>
             </CardContent>
           </Card>
         ))}
