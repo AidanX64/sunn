@@ -8,7 +8,9 @@ edit upstream and re-sync.
 - Upstream HEAD: `dc66b09c3bc09d481793fc4276ec69c5ca09f3f2`
 - Upstream status at copy time: dirty (see below)
 - Copied: 2026-09-09 (robocopy, working tree)
-- Excluded from copy: `.git/`, `build/`, `target/`, `test/target/`, `*.exe`, `*.o`, `*.obj`, `*.a`, `*.lib`, `.scratch/`, `.opencode/`, `examples/`
+- Excluded from copy: `.git/`, `.github/`, `build/`, `target/`, `test/target/`, `*.exe`, `*.o`, `*.obj`, `*.a`, `*.lib`, `.scratch/`, `.opencode/`, `examples/`
+- CI ownership: upstream keeps its own `.github/`; `sunn/.github/workflows/ci.yml`
+- is the only CI in this repo and tests the vendored tree as integrated.
 
 Upstream `git status --short` at copy time:
 

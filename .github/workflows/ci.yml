@@ -1,8 +1,9 @@
 name: ci
 
-# Web (Bun/Next) and vendored forge (C) verification. Deliberately
-# Ubuntu-only: MSVC is untestable on this machine and the MSYS tar
-# grandchild flake is Windows-only (see AGENTS.md gotchas).
+# Web (Bun/Next) and vendored forge (C) verification. CI ownership is split
+# by repo: upstream keeps its own .github/ (not vendored, see
+# scripts/sync-forge.*), and this file is the only CI in sunn. It tests the
+# vendored tree as integrated (including public/packages + resolve API).
 
 on:
   push:
@@ -18,8 +19,13 @@ concurrency:
 
 jobs:
   web:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: web (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -29,6 +35,11 @@ jobs:
           # published linux-x64 release asset (setup-bun 404s on it).
           # 1.4.2 is the newest stable with full release assets.
           bun-version: "1.4.2"
+      - uses: actions/setup-python@v5
+        with:
+          # Fixture packer is `python3`-first; bare `python` is what
+          # Windows devs have. setup-python provides both spellings.
+          python-version: "3.13"
       - name: Install (frozen lockfile)
         run: bun install --frozen-lockfile
       - name: Typecheck
@@ -42,11 +53,13 @@ jobs:
       - name: Committed registry output must be fresh
         run: git diff --exit-code -- public/r
       - name: Rebuild native fixtures
-        # package.json uses bare `python` for Windows devs; Ubuntu runners
-        # only guarantee python3. No tarball-drift gate here: tarballs embed
-        # mtimes by design, so rebuilds are byte-different on purpose.
-        run: python3 scripts/package_registry_fixtures.py
+        # No tarball-drift gate here: tarballs embed mtimes by design,
+        # so rebuilds are byte-different on purpose.
+        run: python scripts/package_registry_fixtures.py
       - name: Smoke-test production server
+        # Git Bash exists on windows-latest, so one bash script covers
+        # both OSes (background `&`, `seq`, `curl` all present).
+        shell: bash
         run: |
           bun --bun next start --port 3100 &
           server=$!
@@ -62,7 +75,18 @@ jobs:
           curl -fsS http://localhost:3100/registry/hello-world > /dev/null
 
   forge:
-    runs-on: ubuntu-latest
+    name: forge (${{ matrix.os }}, ${{ matrix.compiler }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+          - os: macos-latest
+            compiler: clang
+          - os: windows-latest
+            compiler: gcc
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -73,14 +97,43 @@ jobs:
           git config --global user.email "ci@sunn.local"
           git config --global user.name "sunn CI"
           git config --global init.defaultBranch main
-      - name: Clean build (ground truth after header changes)
+      - name: Set up MSYS2 (Windows gcc)
+        if: matrix.os == 'windows-latest'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc make python
+      - name: Clean build (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
         run: make -C forge clean && make -C forge CC=gcc
-      - name: Smoke test
-        run: make -C forge test
-      - name: Fixture run, fresh then incremental
+      - name: Clean build (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: make -C forge clean && make -C forge CC=${{ matrix.compiler }}
+      - name: Smoke test (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
+        run: make -C forge test CC=gcc
+      - name: Smoke test (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: make -C forge test CC=${{ matrix.compiler }}
+      - name: Fixture run, fresh then incremental (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
+        run: |
+          ./forge/build/forge.exe run --release --manifest forge/test/Forge.toml | tee /tmp/forge-run1.log
+          grep -q "Hello world!" /tmp/forge-run1.log
+          ./forge/build/forge.exe run --release --manifest forge/test/Forge.toml
+      - name: Fixture run, fresh then incremental (Linux/macOS)
+        if: matrix.os != 'windows-latest'
         run: |
           ./forge/build/forge run --release --manifest forge/test/Forge.toml | tee /tmp/forge-run1.log
           grep -q "Hello world!" /tmp/forge-run1.log
           ./forge/build/forge run --release --manifest forge/test/Forge.toml
-      - name: Regression suites (deps, registry, engine)
-        run: make -C forge regression
+      - name: Regression suites, deps + registry + engine (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
+        run: make -C forge regression CC=gcc
+      - name: Regression suites, deps + registry + engine (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: make -C forge regression CC=${{ matrix.compiler }}
