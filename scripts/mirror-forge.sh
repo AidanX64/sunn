@@ -93,7 +93,7 @@ This checkout is a read-only mirror. \`sunn/forge\` is canonical — do not edit
 - Canonical commit: \`$sha\` ($commit_date)
 - Canonical files: $(wc -l <"$MANIFEST" | tr -d ' ')
 - Canonical tree hash: \`$root_hash\`
-- Mirrored: $(date -u +%F) (mirror-forge.sh)
+- Mirrored: $(date -u +%F) (mirror-forge)
 EOF
 )"
 note_differs=0
@@ -103,7 +103,11 @@ echo "mirror:    $MIRROR (branch $mirror_branch)"
 echo "missing-in-mirror: $missing; changed: $changed; removed-upstream: $removed; mirror-note-differs: $note_differs"
 if [ "$MODE" = "check" ]; then
   # A stale mirror note alone is informational; only content drift fails.
-  [ "$missing" -eq 0 ] && [ "$changed" -eq 0 ] && [ "$removed" -eq 0 ]
+  if [ "$missing" -eq 0 ] && [ "$changed" -eq 0 ] && [ "$removed" -eq 0 ]; then
+    echo "mirror-forge: clean."
+    exit 0
+  fi
+  exit 1
 fi
 for rel in $removed; do rm -f "$MIRROR/$rel"; done
 while IFS= read -r rel; do

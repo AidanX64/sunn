@@ -133,7 +133,7 @@ try {
         "- Canonical commit: $sha ($commitDate)",
         "- Canonical files: $($sourceFiles.Count)",
         "- Canonical tree hash: $rootHash",
-        "- Mirrored: $([DateTime]::UtcNow.ToString("yyyy-MM-dd")) (mirror-forge.ps1)",
+        "- Mirrored: $([DateTime]::UtcNow.ToString("yyyy-MM-dd")) (mirror-forge)",
         ""
     ) -join "`n"
     $mirrorNotePath = Join-Path $MirrorPath "MIRROR.md"
