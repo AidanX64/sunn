@@ -48,6 +48,15 @@ typedef struct ForgeDepNode {
      * recipe view (definitions are gone by then). */
     char features[FORGE_FEATURES_JOINED_MAX];
     char defaults[FORGE_FEATURES_JOINED_MAX];
+    /* Foreign-build tuning copied from the manifest declaration that won
+     * resolution (first declaration wins, like features). Only used when
+     * the checkout has no Forge.toml. */
+    char cmake_args[FORGE_BUILD_ARGS_MAX][FORGE_MANIFEST_VALUE_MAX];
+    size_t cmake_arg_count;
+    char cmake_toolchain[FORGE_MANIFEST_VALUE_MAX];
+    char make_args[FORGE_BUILD_ARGS_MAX][FORGE_MANIFEST_VALUE_MAX];
+    size_t make_arg_count;
+    char make_target[FORGE_MANIFEST_VALUE_MAX];
     ForgeManifest *manifest;
     int is_native;
     /* Filled by the build stage: native deps point at their objects.txt

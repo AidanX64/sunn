@@ -314,6 +314,8 @@ int forge_orchestrate_add(const char *manifest_path, const char *name,
                           const char *registry_package,
                           const char *registry_version,
                           const char *registry_min_version,
+                          const char *registry_range,
+                          const char *registry_max_version,
                           const char *registry_features,
                           int registry_no_default_features)
 {
@@ -333,6 +335,7 @@ int forge_orchestrate_add(const char *manifest_path, const char *name,
     forge_log_set_session_logger(&logger);
     if (forge_pkg_add(manifest_path, name, git_url, ref_kind, ref_value, dep_path,
                       registry_package, registry_version, registry_min_version,
+                      registry_range, registry_max_version,
                       registry_features, registry_no_default_features,
                       &logger, error, sizeof(error)) != 0) {
         forge_logger_error(&logger, "deps", "%s", error);

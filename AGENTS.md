@@ -179,10 +179,16 @@ Preserve this contract unless there is a concrete reason to version or replace i
 The registry also serves a static `baseline.json` at the site root pinning
 the minimum (version, revision) per package (vcpkg-baseline semantics).
 Manifest entries use `version` for exact pins, `min-version` for minimums,
-or neither (bare entries track the baseline); recipes carry `revision` so a
-recipe fix ships without a new upstream release. All three are validated by
-`lib/sunn-registry.ts` and exercised by `forge/test/registry-regression.sh`
-(R2/R5/R10–R12).
+`version-range` for requirements (`= >= > <= < ^ ~`, wildcards, `,` AND,
+`||` OR) with an optional `max-version` cap, or nothing (bare entries
+track the baseline); top-level `[overrides]` force one exact version per
+package. Recipes carry `revision` so a recipe fix ships without a new
+upstream release. Requirements are validated by `lib/sunn-registry.ts`
+(feature deps) and the forge manifest parser, exercised by
+`forge/test/registry-regression.sh` (R2/R5/R10–R12 baseline pins,
+R16–R19 ranges/max/overrides, R20 `FORGE_OVERLAYS` local-port shadowing,
+R21 foreign-build arg validation) and `forge/test/deps-regression.sh`
+(K8 foreign `make-args`/`make-target`).
 
 Native fixture packages are currently source packages. They are not production binary releases.
 

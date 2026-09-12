@@ -19,13 +19,14 @@ typedef enum ForgeManifestSection {
     FORGE_SECTION_TARGETS,
     FORGE_SECTION_BUILD,
     FORGE_SECTION_DEPENDENCIES,
+    FORGE_SECTION_OVERRIDES,
     FORGE_SECTION_PROFILE_DEBUG,
     FORGE_SECTION_PROFILE_RELEASE
 } ForgeManifestSection;
 
 /* One key = "value" pair inside an inline table ({ git = "...", tag = "..." }). */
 #define FORGE_INLINE_KEY_MAX 32U
-#define FORGE_INLINE_MAX_ENTRIES 8U
+#define FORGE_INLINE_MAX_ENTRIES 20U
 
 typedef struct ForgeInlineEntry {
     char key[FORGE_INLINE_KEY_MAX];
@@ -190,6 +191,9 @@ static ForgeManifestSection parse_section(const char *text)
     }
     if (strcmp(text, "[dependencies]") == 0) {
         return FORGE_SECTION_DEPENDENCIES;
+    }
+    if (strcmp(text, "[overrides]") == 0) {
+        return FORGE_SECTION_OVERRIDES;
     }
     if (strcmp(text, "[profile.debug]") == 0) {
         return FORGE_SECTION_PROFILE_DEBUG;
@@ -523,6 +527,510 @@ int forge_version_compare(const char *a, const char *b)
     return compare_prerelease(pre_a + 1U, pre_b + 1U);
 }
 
+/* ------------------------------------------------------------------ */
+/* Version requirements: full ranges                                   */
+/*                                                                     */
+/* Grammar (no heap, bounded buffers):                                 */
+/*   range    := or_group (OR or_group)                                */
+/*   or_group := term ("," term)                                       */
+/*   term     := [op] version-or-wildcard, op in <= >= < > = ^ ~        */
+/*   version-or-wildcard := star or partial with x-star + optional      */
+/*     -prerelease (wildcards only in numeric core, never with ^ ~ < > */
+/*     except "=" and bare which normalize them). Bare "1.2.3" means   */
+/*     "=1.2.3". Comma = AND, OR = OR, spaces are ignored.             */
+/* ------------------------------------------------------------------ */
+
+static const char *range_skip_spaces(const char *p)
+{
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+    return p;
+}
+
+/* Parses one numeric component which may be digits or x/X/star. Returns 1 on
+ * success with value/wild set; empty component fails. */
+static int range_parse_component(const char **cursor, unsigned long *value,
+                                 int *wild)
+{
+    const char *p = *cursor;
+
+    *wild = 0;
+    if (*p == 'x' || *p == 'X' || *p == '*') {
+        *wild = 1;
+        *value = 0UL;
+        *cursor = p + 1U;
+        return 1;
+    }
+    if (!isdigit((unsigned char)*p)) {
+        return 0;
+    }
+    *value = 0UL;
+    while (isdigit((unsigned char)*p)) {
+        *value = *value * 10UL + (unsigned long)(*p - '0');
+        ++p;
+    }
+    *cursor = p;
+    return 1;
+}
+
+/* Validates prerelease tail "[ -prerelease ][ +build ]" charset; empty ok. */
+static int range_prerelease_tail_valid(const char *p)
+{
+    size_t n = 0U;
+
+    if (*p == '\0') {
+        return 1;
+    }
+    if (*p == '+') {
+        ++p;
+        if (*p == '\0') {
+            return 0;
+        }
+        for (; *p != '\0'; ++p) {
+            unsigned char c = (unsigned char)*p;
+
+            if (!(isalnum(c) || c == '-' || c == '.' || c == '+')) {
+                return 0;
+            }
+            if (++n > 128U) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+    if (*p != '-') {
+        return 0;
+    }
+    ++p;
+    if (*p == '\0') {
+        return 0;
+    }
+    for (; *p != '\0' && *p != '+'; ++p) {
+        unsigned char c = (unsigned char)*p;
+
+        if (!(isalnum(c) || c == '-' || c == '.')) {
+            return 0;
+        }
+        if (++n > 128U) {
+            return 0;
+        }
+    }
+    if (*p == '+') {
+        return range_prerelease_tail_valid(p);
+    }
+    return *p == '\0';
+}
+
+/*
+ * Parses one version-or-wildcard at *cursor (no operator, no spaces).
+ * Fills parts[3], wild[3], has_pre (whether a -prerelease/+build tail was
+ * present) and a normalized exact string when there are no wildcards.
+ * Advances *cursor past the token. Returns 1 on success.
+ */
+static int range_parse_version_token(const char **cursor,
+                                     unsigned long parts[3], int wild[3],
+                                     int *has_pre, char *normalized,
+                                     size_t normalized_size)
+{
+    const char *p = *cursor;
+    const char *tail;
+    char tail_buf[160];
+    size_t tail_len;
+    int dots = 0;
+
+    if (*p == '*' || *p == 'x' || *p == 'X') {
+        /* Lone wildcard: consume exactly one char; trailing alnum fails. */
+        char c = p[1];
+        if (c != '\0' && c != ' ' && c != '\t' && c != ',' && c != '|' &&
+            c != '<' && c != '>' && c != '=' && c != '^' && c != '~') {
+            return 0;
+        }
+        parts[0] = parts[1] = parts[2] = 0UL;
+        wild[0] = wild[1] = wild[2] = 1;
+        *has_pre = 0;
+        if (normalized != NULL) {
+            (void)snprintf(normalized, normalized_size, "*");
+        }
+        *cursor = p + 1U;
+        return 1;
+    }
+    for (dots = 0; dots < 3; ++dots) {
+        wild[dots] = 0;
+    }
+    {
+        int npresent = 0;
+
+        for (dots = 0; dots < 3; ++dots) {
+            if (!range_parse_component(&p, &parts[dots], &wild[dots])) {
+                return 0;
+            }
+            ++npresent;
+            if (dots < 2) {
+                if (*p == '.') {
+                    ++p;
+                    /* "1." or "1.x." with nothing after dot fails below. */
+                    if (*p == '\0') {
+                        return 0;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        /* Missing trailing components (e.g. "1" or "1.2") act as wildcards,
+         * npm-style: "1.2" means "1.2.x". Full "1.2.3" sets no wildcards. */
+        for (dots = npresent; dots < 3; ++dots) {
+            wild[dots] = 1;
+            parts[dots] = 0UL;
+        }
+    }
+    /* Wildcards must be trailing: "1.x.3" is invalid (parsed as numeric
+     * after wild). A leading "x.1" never reaches here (lone-x consumes a
+     * single char, so "x.1" fails at the '.' delimiter check below). */
+    /* Wildcards must be trailing: "1.x.3" or "x.1" are invalid. */
+    {
+        int seen_wild = 0;
+        int filled = 0;
+        /* Count how many components were actually present by re-walking:
+         * simpler rule — once wild, all later must be wild/unset-treated
+         * as wild. Missing trailing components count as wild for ^ ~. */
+        (void)filled;
+        for (dots = 0; dots < 3; ++dots) {
+            if (wild[dots]) {
+                seen_wild = 1;
+            } else if (seen_wild) {
+                return 0;
+            }
+        }
+        /* Leading wildcard like "x.1" already failed since x consumed as
+         * lone token above only when single char; "x.1" reaches here with
+         * wild[0]=1 then numeric -> rejected by the loop above. */
+        if (wild[0]) {
+            return 0;
+        }
+    }
+    tail = p;
+    tail_len = 0U;
+    if (*p == '-' || *p == '+') {
+        const char *q = p;
+
+        while (*q != '\0' && *q != ' ' && *q != '\t' && *q != ',' &&
+               *q != '|') {
+            ++q;
+        }
+        tail_len = (size_t)(q - p);
+        if (tail_len == 0U || tail_len >= sizeof(tail_buf)) {
+            return 0;
+        }
+        memcpy(tail_buf, p, tail_len);
+        tail_buf[tail_len] = '\0';
+        if (!range_prerelease_tail_valid(tail_buf)) {
+            return 0;
+        }
+        /* Wildcards never combine with a prerelease tail. */
+        if (wild[1] || wild[2]) {
+            return 0;
+        }
+        p = q;
+    } else {
+        tail_buf[0] = '\0';
+        /* Stop at delimiter; anything else (e.g. letters) is invalid. */
+        if (*p != '\0' && *p != ' ' && *p != '\t' && *p != ',' &&
+            *p != '|' && *p != '<' && *p != '>' && *p != '=' &&
+            *p != '^' && *p != '~') {
+            return 0;
+        }
+    }
+    *has_pre = tail_buf[0] != '\0';
+    if (normalized != NULL) {
+        if (wild[1] || wild[2]) {
+            (void)snprintf(normalized, normalized_size, "%lu.%lu.%lu",
+                            parts[0], parts[1], parts[2]);
+        } else if (*has_pre) {
+            (void)snprintf(normalized, normalized_size, "%lu.%lu.%lu%s",
+                            parts[0], parts[1], parts[2], tail_buf);
+        } else {
+            (void)snprintf(normalized, normalized_size, "%lu.%lu.%lu",
+                            parts[0], parts[1], parts[2]);
+        }
+        /* Exact tokens without wildcards must be strict semver so later
+         * forge_version_compare ordering is meaningful. */
+        if (!wild[1] && !wild[2] && !version_is_valid(normalized)) {
+            return 0;
+        }
+    }
+    (void)tail;
+    (void)tail_len;
+    *cursor = p;
+    return 1;
+}
+
+static void range_format_version(char *out, size_t out_size,
+                                 unsigned long major, unsigned long minor,
+                                 unsigned long patch)
+{
+    (void)snprintf(out, out_size, "%lu.%lu.%lu", major, minor, patch);
+}
+
+/* Evaluates one comparator against validated `version`. `op` is one of
+ * "", "=", "<=", ">=", "<", ">", "^", "~". Returns -1 on malformed
+ * comparator (validate-only also fails), 0 = no match, 1 = match. */
+static int range_test_comparator(const char *version, const char *op,
+                                 unsigned long parts[3], int wild[3],
+                                 const char *exact)
+{
+    char lower[FORGE_MANIFEST_VALUE_MAX];
+    char upper[FORGE_MANIFEST_VALUE_MAX];
+
+    /* Lone "*" matches everything (including prereleases of same core?
+     * keep simple: matches any validated version). */
+    if (wild[0] && wild[1] && wild[2]) {
+        return 1;
+    }
+    if (strcmp(op, "^") == 0 || strcmp(op, "~") == 0) {
+        /* Wildcards never combine with ^ ~ (validated earlier). */
+        if (wild[1] || wild[2]) {
+            return -1;
+        }
+        range_format_version(lower, sizeof(lower), parts[0], parts[1],
+                             parts[2]);
+        /* Preserve prerelease tail for the lower bound. */
+        if (exact != NULL && strchr(exact, '-') != NULL) {
+            (void)snprintf(lower, sizeof(lower), "%s", exact);
+        }
+        if (forge_version_compare(version, lower) < 0) {
+            return 0;
+        }
+        if (strcmp(op, "^") == 0) {
+            if (parts[0] != 0UL) {
+                range_format_version(upper, sizeof(upper), parts[0] + 1U,
+                                     0UL, 0UL);
+            } else if (parts[1] != 0UL) {
+                range_format_version(upper, sizeof(upper), 0UL,
+                                     parts[1] + 1U, 0UL);
+            } else {
+                /* ^0.0.z is exact. */
+                return forge_version_compare(version, lower) == 0 ? 1 : 0;
+            }
+        } else {
+            /* ~1.2.3 := >=1.2.3 <1.3.0; ~1.2 / ~1 use first two/one. */
+            range_format_version(upper, sizeof(upper), parts[0],
+                                 parts[1] + 1U, 0UL);
+        }
+        return forge_version_compare(version, upper) < 0 ? 1 : 0;
+    }
+    if (wild[1] || wild[2]) {
+        /* Wildcard terms only valid as bare/= (validated earlier). */
+        if (strcmp(op, "") != 0 && strcmp(op, "=") != 0 &&
+            strcmp(op, ">=") != 0) {
+            return -1;
+        }
+        if (wild[1] && !wild[0]) {
+            /* "1.*" / "1.x": >=1.0.0 <2.0.0 */
+            range_format_version(lower, sizeof(lower), parts[0], 0UL, 0UL);
+            range_format_version(upper, sizeof(upper), parts[0] + 1U, 0UL,
+                                 0UL);
+        } else {
+            /* "1.2.*" : >=1.2.0 <1.3.0 */
+            range_format_version(lower, sizeof(lower), parts[0], parts[1],
+                                 0UL);
+            range_format_version(upper, sizeof(upper), parts[0],
+                                 parts[1] + 1U, 0UL);
+        }
+        if (strcmp(op, ">=") == 0) {
+            return forge_version_compare(version, lower) >= 0 ? 1 : 0;
+        }
+        if (forge_version_compare(version, lower) < 0) {
+            return 0;
+        }
+        return forge_version_compare(version, upper) < 0 ? 1 : 0;
+    }
+    /* Exact numeric reference. */
+    {
+        char ref[FORGE_MANIFEST_VALUE_MAX];
+
+        if (exact != NULL && exact[0] != '\0') {
+            (void)snprintf(ref, sizeof(ref), "%s", exact);
+        } else {
+            range_format_version(ref, sizeof(ref), parts[0], parts[1],
+                                 parts[2]);
+        }
+        if (strcmp(op, "") == 0 || strcmp(op, "=") == 0) {
+            return forge_version_compare(version, ref) == 0 ? 1 : 0;
+        }
+        if (strcmp(op, ">=") == 0) {
+            return forge_version_compare(version, ref) >= 0 ? 1 : 0;
+        }
+        if (strcmp(op, ">") == 0) {
+            return forge_version_compare(version, ref) > 0 ? 1 : 0;
+        }
+        if (strcmp(op, "<=") == 0) {
+            return forge_version_compare(version, ref) <= 0 ? 1 : 0;
+        }
+        if (strcmp(op, "<") == 0) {
+            return forge_version_compare(version, ref) < 0 ? 1 : 0;
+        }
+        return -1;
+    }
+}
+
+/* Core range engine: version==NULL means validate-only. Returns 1 when the
+ * range is well-formed (and, when version != NULL, satisfied). */
+static int range_eval(const char *version, const char *range)
+{
+    const char *p;
+
+    if (range == NULL || range[0] == '\0') {
+        return 0;
+    }
+    if (strlen(range) >= FORGE_VERSION_RANGE_MAX) {
+        return 0;
+    }
+    if (version != NULL && !version_is_valid(version)) {
+        return 0;
+    }
+    p = range;
+    for (;;) {
+        int or_ok = 1; /* AND group result */
+        int group_has_term = 0;
+
+        for (;;) {
+            char op[3] = {0};
+            unsigned long parts[3] = {0U, 0U, 0U};
+            int wild[3] = {0, 0, 0};
+            int has_pre = 0;
+            char exact[FORGE_MANIFEST_VALUE_MAX] = {0};
+            int r;
+
+            p = range_skip_spaces(p);
+            if (*p == '\0') {
+                if (!group_has_term) {
+                    return 0; /* trailing || or empty */
+                }
+                break;
+            }
+            if (*p == ',') {
+                return 0; /* leading / double comma */
+            }
+            if (p[0] == '|' && p[1] == '|') {
+                break; /* end of AND group */
+            }
+            /* Operator prefix. */
+            if (p[0] == '<' && p[1] == '=') {
+                op[0] = '<'; op[1] = '=';
+                p += 2;
+            } else if (p[0] == '>' && p[1] == '=') {
+                op[0] = '>'; op[1] = '=';
+                p += 2;
+            } else if (*p == '<' || *p == '>' || *p == '=' ||
+                       *p == '^' || *p == '~') {
+                op[0] = *p;
+                p += 1;
+            }
+            p = range_skip_spaces(p);
+            if (!range_parse_version_token(&p, parts, wild, &has_pre,
+                                           exact, sizeof(exact))) {
+                return 0;
+            }
+            /* Wildcards only with bare/= (and >= as floor sugar). */
+            if ((wild[1] || wild[2]) &&
+                !(strcmp(op, "") == 0 || strcmp(op, "=") == 0 ||
+                  strcmp(op, ">=") == 0)) {
+                return 0;
+            }
+            /* ^ ~ never take prerelease/wildcard tails (checked above). */
+            if ((strcmp(op, "^") == 0 || strcmp(op, "~") == 0) &&
+                (wild[1] || wild[2])) {
+                return 0;
+            }
+            group_has_term = 1;
+            if (version != NULL) {
+                r = range_test_comparator(version, op, parts, wild, exact);
+                if (r < 0) {
+                    return 0;
+                }
+                if (!r) {
+                    or_ok = 0;
+                }
+            }
+            p = range_skip_spaces(p);
+            if (*p == ',') {
+                ++p;
+                p = range_skip_spaces(p);
+                if (*p == '\0' || (p[0] == '|' && p[1] == '|')) {
+                    return 0; /* trailing comma */
+                }
+                continue;
+            }
+            if (p[0] == '|' && p[1] == '|') {
+                break;
+            }
+            if (*p == '\0') {
+                break;
+            }
+            /* Anything else (e.g. stray ops) ends the term invalidly. */
+            if (*p == '<' || *p == '>' || *p == '=' || *p == '^' ||
+                *p == '~') {
+                /* Missing comma between comparators: ">=1.0.0 <2.0.0"
+                 * space-separated form — accept as AND like npm. */
+                continue;
+            }
+            return 0;
+        }
+        if (version != NULL && or_ok && group_has_term) {
+            return 1;
+        }
+        p = range_skip_spaces(p);
+        if (*p == '\0') {
+            return version == NULL ? 1 : 0;
+        }
+        if (p[0] == '|' && p[1] == '|') {
+            p += 2;
+            p = range_skip_spaces(p);
+            if (*p == '\0') {
+                return 0;
+            }
+            continue;
+        }
+        return 0;
+    }
+}
+
+int forge_version_range_is_valid(const char *range)
+{
+    size_t i;
+
+    if (range == NULL || range[0] == '\0') {
+        return 0;
+    }
+    /* Tight charset: digits, semver punctuation, range operators,
+     * wildcards, spaces, prerelease/build tails. Anything else (shell
+     * metachars, quotes, backslashes) fails closed. */
+    for (i = 0U; range[i] != '\0'; ++i) {
+        unsigned char c = (unsigned char)range[i];
+
+        if (!(isalnum(c) || c == '.' || c == '-' || c == '+' ||
+              c == '<' || c == '>' || c == '=' || c == '^' ||
+              c == '~' || c == ',' || c == '|' || c == '*' ||
+              c == ' ' || c == '\t')) {
+            return 0;
+        }
+    }
+    return range_eval(NULL, range);
+}
+
+int forge_version_satisfies(const char *version, const char *range)
+{
+    if (range == NULL || range[0] == '\0') {
+        return 1; /* no constraint satisfies everything */
+    }
+    if (version == NULL || version[0] == '\0') {
+        return 0;
+    }
+    return range_eval(version, range);
+}
+
 /*
  * Parses a strict inline table: '{' key = "string" (, key = "string")* '}'.
  * Bare keys are short identifiers; values are quoted strings; trailing
@@ -724,6 +1232,137 @@ int forge_parse_feature_list(const char *name, const char *text,
     return 0;
 }
 
+/* Build args travel as one comma-separated inline-table string (inline
+ * tables only carry quoted strings, like features) and become argv
+ * elements — never shell text. Each element must be non-empty, fit, and
+ * avoid shell metacharacters so a manifest cannot smuggle `$(...)`,
+ * backticks, redirects, or chaining into the CMake/Make invocation. */
+static int build_arg_is_valid(const char *arg)
+{
+    size_t i;
+
+    if (arg == NULL || arg[0] == '\0' ||
+        strlen(arg) >= FORGE_MANIFEST_VALUE_MAX) {
+        return 0;
+    }
+    for (i = 0U; arg[i] != '\0'; ++i) {
+        char c = arg[i];
+
+        if (c == ';' || c == '|' || c == '&' || c == '$' || c == '`' ||
+            c == '\\' || c == '"' || c == '\'' || c == '(' ||
+            c == ')' || c == '<' || c == '>' || c == '\n' ||
+            c == '\r') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int parse_build_arg_list(const char *name, const char *field,
+                                const char *text, char out[][FORGE_MANIFEST_VALUE_MAX],
+                                size_t *count, char *error, size_t error_size)
+{
+    const char *cursor = text;
+
+    *count = 0U;
+    for (;;) {
+        const char *item;
+        size_t length;
+        char candidate[FORGE_MANIFEST_VALUE_MAX];
+
+        while (*cursor == ' ' || *cursor == '\t') {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        item = cursor;
+        while (*cursor != '\0' && *cursor != ',') {
+            ++cursor;
+        }
+        length = (size_t)(cursor - item);
+        while (length != 0U &&
+               (item[length - 1U] == ' ' || item[length - 1U] == '\t')) {
+            --length;
+        }
+        if (length == 0U || length >= FORGE_MANIFEST_VALUE_MAX) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': '%s' has an empty or overlong entry",
+                      name, field);
+            return -1;
+        }
+        memcpy(candidate, item, length);
+        candidate[length] = '\0';
+        if (!build_arg_is_valid(candidate)) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': '%s' entry '%s' uses shell "
+                      "metacharacters; pass plain VAR=value or -D flags",
+                      name, field, candidate);
+            return -1;
+        }
+        if (*count == FORGE_BUILD_ARGS_MAX) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': '%s' lists more than %u entries",
+                      name, field, (unsigned int)FORGE_BUILD_ARGS_MAX);
+            return -1;
+        }
+        memcpy(out[*count], candidate, length + 1U);
+        ++*count;
+        if (*cursor == '\0') {
+            break;
+        }
+        ++cursor; /* skip ',' */
+    }
+    return 0;
+}
+
+/* Toolchain paths become one -DCMAKE_TOOLCHAIN_FILE=<path> argv element
+ * resolved against the dep root (or absolute). Only path-safe characters;
+ * ".." is rejected here so the later within-root check cannot be dodged
+ * by spelling. */
+static int toolchain_path_is_valid(const char *path)
+{
+    size_t i;
+
+    if (path == NULL || path[0] == '\0' ||
+        strlen(path) >= FORGE_MANIFEST_VALUE_MAX) {
+        return 0;
+    }
+    if (strstr(path, "..") != NULL) {
+        return 0;
+    }
+    for (i = 0U; path[i] != '\0'; ++i) {
+        unsigned char c = (unsigned char)path[i];
+
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+              c == '.' || c == '/' || c == '\\' || c == ':' || c == ' ')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int make_target_is_valid(const char *target)
+{
+    size_t i;
+
+    if (target == NULL || target[0] == '\0' ||
+        strlen(target) >= FORGE_MANIFEST_VALUE_MAX) {
+        return 0;
+    }
+    for (i = 0U; target[i] != '\0'; ++i) {
+        unsigned char c = (unsigned char)target[i];
+
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+              c == '.' || c == '+')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int parse_dependency_assignment(ForgeDependencyList *list, const char *name,
                                        char *value, char *error, size_t error_size)
 {
@@ -770,12 +1409,19 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
             find_inline_entry(entries, count, "version");
         const ForgeInlineEntry *min_version_entry =
             find_inline_entry(entries, count, "min-version");
+        const ForgeInlineEntry *range_entry =
+            find_inline_entry(entries, count, "version-range");
+        const ForgeInlineEntry *max_version_entry =
+            find_inline_entry(entries, count, "max-version");
         const ForgeInlineEntry *features_entry =
             find_inline_entry(entries, count, "features");
         const ForgeInlineEntry *default_features_entry =
             find_inline_entry(entries, count, "default-features");
         int source_count = (entry != NULL) + (git_entry != NULL) +
                            (registry_entry != NULL);
+        int pin_count = (version_entry != NULL) +
+                        (min_version_entry != NULL) +
+                        (range_entry != NULL);
 
         if (source_count != 1) {
             forge_util_set_error(error, error_size,
@@ -795,10 +1441,29 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
                       "dependencies", name);
             return -1;
         }
-        if (min_version_entry != NULL && version_entry != NULL) {
+        if (range_entry != NULL && registry_entry == NULL) {
             forge_util_set_error(error, error_size,
-                      "dependency '%s': use only one of version (exact pin) "
-                      "or min-version (minimum)", name);
+                      "dependency '%s': version-range only applies to registry "
+                      "dependencies", name);
+            return -1;
+        }
+        if (max_version_entry != NULL && registry_entry == NULL) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': max-version only applies to registry "
+                      "dependencies", name);
+            return -1;
+        }
+        if (pin_count > 1) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': use only one of version (exact pin), "
+                      "min-version (minimum), or version-range (requirement)",
+                      name);
+            return -1;
+        }
+        if (max_version_entry != NULL && version_entry != NULL) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': max-version cannot combine with an "
+                      "exact version pin", name);
             return -1;
         }
         if ((features_entry != NULL || default_features_entry != NULL) &&
@@ -844,6 +1509,12 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
     dependency->registry[0] = '\0';
     dependency->registry_version[0] = '\0';
     dependency->registry_min_version[0] = '\0';
+    dependency->registry_range[0] = '\0';
+    dependency->registry_max_version[0] = '\0';
+    dependency->cmake_arg_count = 0U;
+    dependency->cmake_toolchain[0] = '\0';
+    dependency->make_arg_count = 0U;
+    dependency->make_target[0] = '\0';
     dependency->feature_count = 0U;
     dependency->default_features = 1;
     if (entry != NULL) {
@@ -913,6 +1584,10 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
         {
             const ForgeInlineEntry *min_entry =
                 find_inline_entry(entries, count, "min-version");
+            const ForgeInlineEntry *range_entry =
+                find_inline_entry(entries, count, "version-range");
+            const ForgeInlineEntry *max_entry =
+                find_inline_entry(entries, count, "max-version");
 
             if (min_entry != NULL) {
                 if (!version_is_valid(min_entry->value)) {
@@ -925,6 +1600,48 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
                 (void)snprintf(dependency->registry_min_version,
                                sizeof(dependency->registry_min_version), "%s",
                                min_entry->value);
+            }
+            if (range_entry != NULL) {
+                if (strlen(range_entry->value) >=
+                    sizeof(dependency->registry_range)) {
+                    forge_util_set_error(error, error_size,
+                              "dependency '%s': version-range is too long "
+                              "(max %u characters)", name,
+                              (unsigned int)(sizeof(dependency->registry_range) - 1U));
+                    return -1;
+                }
+                if (!forge_version_range_is_valid(range_entry->value)) {
+                    forge_util_set_error(error, error_size,
+                              "dependency '%s': version-range '%s' is not "
+                              "valid; use comparators =, >=, >, <=, <, ^, ~, "
+                              "wildcards x/*, ',' for AND, '||' for OR",
+                              name, range_entry->value);
+                    return -1;
+                }
+                (void)snprintf(dependency->registry_range,
+                               sizeof(dependency->registry_range), "%s",
+                               range_entry->value);
+            }
+            if (max_entry != NULL) {
+                if (!version_is_valid(max_entry->value)) {
+                    forge_util_set_error(error, error_size,
+                              "dependency '%s': max-version '%s' is not a "
+                              "valid version; use MAJOR.MINOR.PATCH",
+                              name, max_entry->value);
+                    return -1;
+                }
+                (void)snprintf(dependency->registry_max_version,
+                               sizeof(dependency->registry_max_version), "%s",
+                               max_entry->value);
+            }
+            if (min_entry != NULL && max_entry != NULL &&
+                forge_version_compare(min_entry->value,
+                                      max_entry->value) > 0) {
+                forge_util_set_error(error, error_size,
+                          "dependency '%s': min-version '%s' exceeds "
+                          "max-version '%s'", name, min_entry->value,
+                          max_entry->value);
+                return -1;
             }
         }
         {
@@ -945,7 +1662,7 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
                 (void)snprintf(flag_value, sizeof(flag_value), "%s",
                                defaults_entry->value);
                 if (parse_boolean(flag_value, &dependency->default_features,
-                                  error, error_size) != 0) {
+                                   error, error_size) != 0) {
                     forge_util_set_error(error, error_size,
                               "dependency '%s': default-features must be "
                               "\"true\" or \"false\"",
@@ -955,17 +1672,74 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
             }
         }
     }
+    /* Foreign-build tuning applies to every source type (path, git,
+     * registry): it is consumed when the checkout builds foreign
+     * (CMake/Make) and ignored for native Forge.toml checkouts. */
+    {
+        const ForgeInlineEntry *cmake_args_entry =
+            find_inline_entry(entries, count, "cmake-args");
+            const ForgeInlineEntry *toolchain_entry =
+                find_inline_entry(entries, count, "cmake-toolchain");
+            const ForgeInlineEntry *make_args_entry =
+                find_inline_entry(entries, count, "make-args");
+            const ForgeInlineEntry *make_target_entry =
+                find_inline_entry(entries, count, "make-target");
+
+            if (cmake_args_entry != NULL &&
+                parse_build_arg_list(name, "cmake-args",
+                                     cmake_args_entry->value,
+                                     dependency->cmake_args,
+                                     &dependency->cmake_arg_count,
+                                     error, error_size) != 0) {
+                return -1;
+            }
+            if (toolchain_entry != NULL) {
+                if (!toolchain_path_is_valid(toolchain_entry->value)) {
+                    forge_util_set_error(error, error_size,
+                              "dependency '%s': cmake-toolchain '%s' is not "
+                              "a safe path; use a relative or absolute file "
+                              "path without '..' or shell characters",
+                              name, toolchain_entry->value);
+                    return -1;
+                }
+                (void)snprintf(dependency->cmake_toolchain,
+                               sizeof(dependency->cmake_toolchain), "%s",
+                               toolchain_entry->value);
+            }
+            if (make_args_entry != NULL &&
+                parse_build_arg_list(name, "make-args",
+                                     make_args_entry->value,
+                                     dependency->make_args,
+                                     &dependency->make_arg_count,
+                                     error, error_size) != 0) {
+                return -1;
+            }
+            if (make_target_entry != NULL) {
+                if (!make_target_is_valid(make_target_entry->value)) {
+                    forge_util_set_error(error, error_size,
+                              "dependency '%s': make-target '%s' is not a "
+                              "valid goal; use letters, digits, '-', '_', "
+                              "'.', '+'",
+                              name, make_target_entry->value);
+                    return -1;
+                }
+                (void)snprintf(dependency->make_target,
+                               sizeof(dependency->make_target), "%s",
+                               make_target_entry->value);
+            }
+    }
     /* Reject unknown keys so typos fail loudly. */
     for (index = 0U; index < count; ++index) {
         static const char *const allowed[] = {
             "path", "git", "tag", "branch", "rev", "submodules",
-            "registry", "version", "min-version", "features",
-            "default-features"
+            "registry", "version", "min-version", "version-range",
+            "max-version", "features", "default-features",
+            "cmake-args", "cmake-toolchain", "make-args", "make-target"
         };
         size_t allowed_index;
         int known = 0;
 
-        for (allowed_index = 0U; allowed_index < 11U; ++allowed_index) {
+        for (allowed_index = 0U; allowed_index < 17U; ++allowed_index) {
             if (strcmp(entries[index].key, allowed[allowed_index]) == 0) {
                 known = 1;
                 break;
@@ -1084,6 +1858,44 @@ static int parse_assignment(ForgeManifestSection section, char *line,
     if (section == FORGE_SECTION_DEPENDENCIES) {
         return parse_dependency_assignment(&manifest->dependencies, key, value,
                                            error, error_size);
+    }
+    if (section == FORGE_SECTION_OVERRIDES) {
+        char parsed[FORGE_MANIFEST_VALUE_MAX];
+        size_t index;
+
+        if (!dependency_name_is_valid(key)) {
+            forge_util_set_error(error, error_size,
+                      "'%s' is not a valid override name; use letters, digits, "
+                      "'-', '_', '.'", key);
+            return -1;
+        }
+        if (parse_scalar(value, parsed, sizeof(parsed), error, error_size) != 0) {
+            return -1;
+        }
+        if (!version_is_valid(parsed)) {
+            forge_util_set_error(error, error_size,
+                      "override '%s': version '%s' must be MAJOR.MINOR.PATCH "
+                      "with an optional -prerelease", key, parsed);
+            return -1;
+        }
+        for (index = 0U; index < manifest->override_count; ++index) {
+            if (strcmp(manifest->overrides[index].name, key) == 0) {
+                forge_util_set_error(error, error_size,
+                          "duplicate override '%s'", key);
+                return -1;
+            }
+        }
+        if (manifest->override_count == FORGE_MANIFEST_MAX_OVERRIDES) {
+            forge_util_set_error(error, error_size, "more than %u overrides",
+                      (unsigned int)FORGE_MANIFEST_MAX_OVERRIDES);
+            return -1;
+        }
+        (void)snprintf(manifest->overrides[manifest->override_count].name,
+                       sizeof(manifest->overrides[0].name), "%s", key);
+        (void)snprintf(manifest->overrides[manifest->override_count].version,
+                       sizeof(manifest->overrides[0].version), "%s", parsed);
+        ++manifest->override_count;
+        return 0;
     }
     if (section == FORGE_SECTION_PROFILE_DEBUG) {
         return parse_profile_assignment(&seen->debug, &manifest->debug_profile,

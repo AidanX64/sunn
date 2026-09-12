@@ -20,14 +20,16 @@
  * Adds `name` backed by a git source (`git_url`, optionally pinned by
  * `ref_value` under the field named by `ref_kind`: "tag", "branch", or
  * "rev"), a path source (`dep_path`), or a registry source
- * (`registry_package`, pinned exactly by `registry_version` or floored by
- * `registry_min_version`; "" for both tracks the baseline, newest when the
- * registry states none — the resolved release is still pinned in
+ * (`registry_package`, pinned exactly by `registry_version`, floored by
+ * `registry_min_version`, constrained by `registry_range`, and/or capped
+ * by `registry_max_version`; "" for all tracks the baseline, newest when
+ * the registry states none — the resolved release is still pinned in
  * Forge.lock immediately). At most one of `registry_version` /
- * `registry_min_version` may be non-empty; `registry_features` is a
- * comma-separated feature request ("" for none) and
- * `registry_no_default_features` disables recipe defaults — both need a
- * registry source. Exactly one of `git_url` / `dep_path` /
+ * `registry_min_version` / `registry_range` may be non-empty,
+ * `registry_max_version` never combines with exact version;
+ * `registry_features` is a comma-separated feature request ("" for none)
+ * and `registry_no_default_features` disables recipe defaults — both
+ * need a registry source. Exactly one of `git_url` / `dep_path` /
  * `registry_package` must be non-empty. Resolution progress goes to
  * `logger`.
  * Returns 0 on success.
@@ -37,6 +39,8 @@ int forge_pkg_add(const char *manifest_path, const char *name,
                   const char *ref_value, const char *dep_path,
                   const char *registry_package, const char *registry_version,
                   const char *registry_min_version,
+                  const char *registry_range,
+                  const char *registry_max_version,
                   const char *registry_features,
                   int registry_no_default_features,
                   ForgeLogger *logger, char *error, size_t error_size);

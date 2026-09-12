@@ -104,8 +104,15 @@ as possible, regardless of target OS, architecture, or toolchain.
 - `forge test` builds each `tests/*.c` as a self-contained binary (own
   `main`); missing/empty `tests/` exits 0.
 - `[dependencies]` supports path deps, git deps pinned by commit in a
-  generated `Forge.lock`, and registry deps (`registry = "name"` with an
-  optional `version`) pinned by version + tarball sha256; foreign deps are
+  generated `Forge.lock`, and registry deps (`registry = "name"` with
+  `version` exact, `min-version`, `version-range` (`= >= > <= < ^ ~`,
+  wildcards, `,` AND, `||` OR), and/or `max-version`) pinned by version
+  + tarball sha256; top-level `[overrides]` force one exact version per
+  package (transitive manifests must not declare them). Per-dep
+  `cmake-args`/`cmake-toolchain`/`make-args`/`make-target` tune foreign
+  builds (argv only, metachars rejected; args change forces a clean
+  foreign rebuild tracked by `.forge-foreign-args`); `FORGE_OVERLAYS`
+  names local site roots shadowing the registry. Foreign deps are
   detected as CMake or Make and must produce a static library.
 - The forge version string lives in `include/forge/version.h`.
 

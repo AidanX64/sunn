@@ -259,19 +259,31 @@ hello_lib = { path = "../libhello" }
 coolib    = { git = "https://github.com/example/coolib", tag = "v1.2" }   # branch/rev also work
 serde_c   = { registry = "serde-c", version = "0.1.0" }                   # exact pin, never moves
 serde_d   = { registry = "serde-d", min-version = "0.2.0" }                # minimum, floats within [min, newest]
+serde_f   = { registry = "serde-f", version-range = ">=1.2.0, <2.0.0" }    # requirement: newest satisfying release
+serde_g   = { registry = "serde-g", max-version = "1.4.2" }                # inclusive cap, combinable with min/range
 serde_e   = { registry = "serde-e" }                                      # bare: tracks the registry baseline
+
+[overrides]
+serde-d = "0.2.1"   # force one exact version wherever serde-d is required
 ```
 
 - Registry deps are versioned recipes, vcpkg-style: the registry's
   `baseline.json` pins the minimum (version, revision) per package.
   Exact `version` pins bypass the baseline and never move (only the
-  manifest moves them); `min-version` and bare entries resolve no lower
-  than the floor, and `forge update` moves them to newest. The resolved
-  recipe revision rides along in `Forge.lock`, so a recipe fix without a
-  new upstream release updates cleanly instead of tripping the
-  tamper gate — while same-version bytes that change under a pin are
-  still refused loudly. A lockfile from before revisions (no `revision`
-  key) keeps resolving byte-identically.
+  manifest moves them); `min-version`, `version-range`, `max-version`,
+  and bare entries resolve no lower than the floor, and `forge update`
+  moves them to newest. Version ranges use comparators `=`, `>=`, `>`,
+  `<=`, `<`, `^` (compatible), `~` (tilde), and wildcards (`1.2.x`,
+  `*`); comma means AND and `||` means OR
+  (`"^1.4.0"`, `"~1.2.0"`, `">=1.0.0, <2.0.0 || >=3.0.0"`).
+  Top-level `[overrides]` force one exact version per package across the
+  whole graph (transitive manifests may not declare them); an override
+  that conflicts with an exact pin, or that a range/min/max does not
+  admit, fails loudly. The resolved recipe revision rides along in
+  `Forge.lock`, so a recipe fix without a new upstream release updates
+  cleanly instead of tripping the tamper gate — while same-version bytes
+  that change under a pin are still refused loudly. A lockfile from
+  before revisions (no `revision` key) keeps resolving byte-identically.
 
 - Git deps are cloned into a shared cache (`~/.forge/git`, override with
   `FORGE_HOME`) and pinned by resolved commit SHA in a generated `Forge.lock`
@@ -286,9 +298,18 @@ serde_e   = { registry = "serde-e" }                                      # bare
   `[dependencies]`); cycles are rejected with a clear error.
 - A dependency is built with whatever it ships:
   - a `Forge.toml` → built natively by forge's own engine;
-  - a `CMakeLists.txt` → `cmake` configure + build;
-  - a `Makefile` → `make -jN CC=<dispatched compiler>`;
+  - a `CMakeLists.txt` → `cmake` configure + build, with optional
+    per-dependency `cmake-args = "-DFOO=ON, -DBAR=OFF"` (extra configure
+    argv, comma-separated, never shelled) and
+    `cmake-toolchain = "cmake/toolchain.cmake"` (file inside the
+    checkout, passed as `-DCMAKE_TOOLCHAIN_FILE=`);
+  - a `Makefile` → `make -jN CC=<dispatched compiler>` plus optional
+    `make-args = "VAR=1, -k"` (extra argv) and `make-target = "install"`
+    (one goal, default target when empty);
   - anything else is an error naming the dependency.
+  Build args are part of dependency identity (divergent diamonds
+  conflict), and an args change forces a clean foreign rebuild of that
+  checkout (stale objects are removed; CMake reconfigures).
 - Include directories (`<dep>/include`, else the dep root) feed every compile;
   the dep's objects/static library (`.a`/`.lib`) feed the link line.
   Dynamic libraries are out of scope for now.
@@ -313,6 +334,7 @@ forge add mylib --git https://github.com/example/mylib --tag v1.2
 forge add utils --path ../utils      # path deps are used in place, never cached
 forge add hello --registry hello-c --version 0.1.0   # exact pin
 forge add hello --registry hello-c --min-version 0.1.0   # minimum
+forge add hello --registry hello-c --version-range "^1.2.0" --max-version 1.9.9
 forge add hello --registry hello-c   # bare: tracks the baseline
 forge update mylib                   # pull just this dep to its newest allowed state
 forge remove mylib                   # drop the entry and prune its lock pin
@@ -324,8 +346,9 @@ immediately so `Forge.lock` gains its pin, and rolls the edit back if
 resolution fails (a bad URL or missing path never leaves a half-added dep).
 Exactly one source (`--git` / `--path` / `--registry`) is accepted; git
 sources may pin at most one ref (`--tag`, `--branch`, or `--rev`), registry
-sources at most one `version` (`--version`). `remove` errors on unknown
-names, listing the dependencies that do exist.
+sources at most one of `--version` / `--min-version` / `--version-range`
+plus an optional `--max-version` (never with `--version`). `remove` errors
+on unknown names, listing the dependencies that do exist.
 
 ### Registry dependencies
 
@@ -353,7 +376,18 @@ hello = { registry = "hello-c", version = "0.1.0" }
 - Transports mirror the git allowlist: `https://` always, `http://` only
   for loopback, `file://` only with `FORGE_ALLOW_UNSAFE_REGISTRY=1`
   (local mirrors and the regression suite use it; a `file://` base
-  points at the site root, same as `https://`).
+  points at the site root, same as `https://`). A `git+` base URL is
+  rejected with a pointer to overlays: version history still lives in
+  the static index (`packages/sunn.registry.json` with `versions[]`),
+  not in a git registry — that is the staged next phase.
+- Local ports shadow the registry through overlays: `FORGE_OVERLAYS`
+  names one or more site roots (`;`-separated on Windows, `:` elsewhere)
+  with the same static layout (`packages/sunn.registry.json` plus
+  `packages/<name>/<version>.json` and tarballs). The first overlay
+  naming a recipe wins over the configured registry for both queries
+  and range listings, so patched or proprietary ports resolve without a
+  registry round-trip. Overlay tarball locations resolve against the
+  overlay root itself.
 - Downloads shell out to `curl` (PowerShell `Invoke-WebRequest` as a
   Windows fallback) and unpack with `tar` — no new libraries. On
   MSYS2/Git-Bash shells, make sure *native* curl/tar come first on PATH:

@@ -458,6 +458,8 @@ int forge_pkg_add(const char *manifest_path, const char *name,
                   const char *ref_value, const char *dep_path,
                   const char *registry_package, const char *registry_version,
                   const char *registry_min_version,
+                  const char *registry_range,
+                  const char *registry_max_version,
                   const char *registry_features,
                   int registry_no_default_features,
                   ForgeLogger *logger, char *error, size_t error_size)
@@ -473,8 +475,12 @@ int forge_pkg_add(const char *manifest_path, const char *name,
     char *escaped_second = NULL;
     char *escaped_features = NULL;
     char *entry_line = NULL;
+    char *escaped_range = NULL;
+    char *escaped_max = NULL;
     char resolved_version[FORGE_MANIFEST_VALUE_MAX] = {0};
     char resolved_min[FORGE_MANIFEST_VALUE_MAX] = {0};
+    char resolved_range[FORGE_VERSION_RANGE_MAX] = {0};
+    char resolved_max[FORGE_MANIFEST_VALUE_MAX] = {0};
     char joined_features[FORGE_FEATURES_JOINED_MAX] = {0};
     size_t needed;
     size_t index;
@@ -484,6 +490,8 @@ int forge_pkg_add(const char *manifest_path, const char *name,
     int has_ref = ref_value != NULL && ref_value[0] != '\0';
     int has_reg_version = registry_version != NULL && registry_version[0] != '\0';
     int has_reg_min = registry_min_version != NULL && registry_min_version[0] != '\0';
+    int has_reg_range = registry_range != NULL && registry_range[0] != '\0';
+    int has_reg_max = registry_max_version != NULL && registry_max_version[0] != '\0';
     int has_reg_features = registry_features != NULL && registry_features[0] != '\0';
     const char *kind = ref_kind != NULL ? ref_kind : "";
 
@@ -529,9 +537,27 @@ int forge_pkg_add(const char *manifest_path, const char *name,
                   "'%s': --min-version only applies to registry dependencies", name);
         return -1;
     }
-    if (has_reg_version && has_reg_min) {
+    if (has_reg_range && !has_registry) {
         forge_util_set_error(error, error_size,
-                  "'%s': use only one of --version/--min-version", name);
+                  "'%s': --version-range only applies to registry dependencies",
+                  name);
+        return -1;
+    }
+    if (has_reg_max && !has_registry) {
+        forge_util_set_error(error, error_size,
+                  "'%s': --max-version only applies to registry dependencies",
+                  name);
+        return -1;
+    }
+    if ((int)has_reg_version + (int)has_reg_min + (int)has_reg_range > 1) {
+        forge_util_set_error(error, error_size,
+                  "'%s': use only one of --version/--min-version/--version-range",
+                  name);
+        return -1;
+    }
+    if (has_reg_max && has_reg_version) {
+        forge_util_set_error(error, error_size,
+                  "'%s': --max-version cannot combine with --version", name);
         return -1;
     }
     if ((has_reg_features || registry_no_default_features) && !has_registry) {
@@ -600,7 +626,8 @@ int forge_pkg_add(const char *manifest_path, const char *name,
     if (has_registry) {
         /*
          * An exact pin is written verbatim; a minimum is written as
-         * min-version (validated when the manifest reloads below). A bare
+         * min-version, a requirement as version-range, an upper bound as
+         * max-version (validated when the manifest reloads below). A bare
          * entry names no version at all and resolves to the baseline at
          * resolve time. The resolve below verifies every shape and rolls
          * back on failure.
@@ -619,6 +646,27 @@ int forge_pkg_add(const char *manifest_path, const char *name,
                 forge_util_set_error(error, error_size, "registry version is too long");
                 goto fail_before_write;
             }
+        } else if (has_reg_range) {
+            if (snprintf(resolved_range, sizeof(resolved_range), "%s",
+                         registry_range) < 0 ||
+                strlen(registry_range) >= sizeof(resolved_range)) {
+                forge_util_set_error(error, error_size, "registry version-range is too long");
+                goto fail_before_write;
+            }
+            if (!forge_version_range_is_valid(resolved_range)) {
+                forge_util_set_error(error, error_size,
+                          "'%s': version-range '%s' is not valid", name,
+                          resolved_range);
+                goto fail_before_write;
+            }
+        }
+        if (has_reg_max) {
+            if (snprintf(resolved_max, sizeof(resolved_max), "%s",
+                         registry_max_version) < 0 ||
+                strlen(registry_max_version) >= sizeof(resolved_max)) {
+                forge_util_set_error(error, error_size, "registry max-version is too long");
+                goto fail_before_write;
+            }
         }
     }
 
@@ -632,20 +680,29 @@ int forge_pkg_add(const char *manifest_path, const char *name,
     } else if (has_reg_min) {
         escaped_second = escape_manifest_string(resolved_min);
     }
+    if (has_reg_range) {
+        escaped_range = escape_manifest_string(resolved_range);
+    }
+    if (has_reg_max) {
+        escaped_max = escape_manifest_string(resolved_max);
+    }
     if (has_reg_features) {
         escaped_features = escape_manifest_string(joined_features);
     }
     if (escaped_value == NULL ||
         ((has_reg_version || has_reg_min) && escaped_second == NULL) ||
+        (has_reg_range && escaped_range == NULL) ||
+        (has_reg_max && escaped_max == NULL) ||
         (has_reg_features && escaped_features == NULL) ||
         (has_ref && escaped_ref == NULL)) {
         forge_util_set_error(error, error_size, "out of memory");
         goto fail_before_write;
     }
     /* Optional registry segments, built first so the entry line can be
-     * sized exactly: an exact/minimum pin, a feature request, and the
-     * defaults opt-out compose freely. */
-    char version_segment[FORGE_MANIFEST_VALUE_MAX + 32U] = {0};
+     * sized exactly: an exact/minimum/range pin, an upper bound, a feature
+     * request, and the defaults opt-out compose freely. */
+    char version_segment[FORGE_VERSION_RANGE_MAX + 32U] = {0};
+    char max_segment[FORGE_MANIFEST_VALUE_MAX + 32U] = {0};
     char features_segment[FORGE_FEATURES_JOINED_MAX + 32U] = {0};
     char defaults_segment[32] = {0};
 
@@ -655,6 +712,13 @@ int forge_pkg_add(const char *manifest_path, const char *name,
     } else if (has_reg_min) {
         (void)snprintf(version_segment, sizeof(version_segment),
                        ", min-version = \"%s\"", escaped_second);
+    } else if (has_reg_range) {
+        (void)snprintf(version_segment, sizeof(version_segment),
+                       ", version-range = \"%s\"", escaped_range);
+    }
+    if (has_reg_max) {
+        (void)snprintf(max_segment, sizeof(max_segment),
+                       ", max-version = \"%s\"", escaped_max);
     }
     if (has_reg_features) {
         (void)snprintf(features_segment, sizeof(features_segment),
@@ -666,16 +730,16 @@ int forge_pkg_add(const char *manifest_path, const char *name,
     }
     needed = strlen(name) + strlen(escaped_value) + 48U +
              (has_ref ? strlen(kind) + strlen(escaped_ref) + 8U : 0U) +
-             strlen(version_segment) + strlen(features_segment) +
-             strlen(defaults_segment);
+             strlen(version_segment) + strlen(max_segment) +
+             strlen(features_segment) + strlen(defaults_segment);
     entry_line = malloc(needed);
     if (entry_line == NULL) {
         forge_util_set_error(error, error_size, "out of memory");
         goto fail_before_write;
     }
     if (has_registry) {
-        (void)snprintf(entry_line, needed, "%s = { registry = \"%s\"%s%s%s }",
-                       name, escaped_value, version_segment,
+        (void)snprintf(entry_line, needed, "%s = { registry = \"%s\"%s%s%s%s }",
+                       name, escaped_value, version_segment, max_segment,
                        features_segment, defaults_segment);
     } else if (has_git) {
         if (has_ref) {
@@ -734,6 +798,8 @@ int forge_pkg_add(const char *manifest_path, const char *name,
     free(escaped_value);
     free(escaped_ref);
     free(escaped_second);
+    free(escaped_range);
+    free(escaped_max);
     free(escaped_features);
     line_list_free(&lines);
     line_list_free(&backup);
@@ -746,6 +812,8 @@ fail_before_write:
     free(escaped_value);
     free(escaped_ref);
     free(escaped_second);
+    free(escaped_range);
+    free(escaped_max);
     free(escaped_features);
     line_list_free(&lines);
     line_list_free(&backup);

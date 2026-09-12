@@ -24,7 +24,8 @@ static void print_usage(FILE *stream)
             "                        re-resolve deps (one, or all when NAME is omitted)\n"
             "  forge add <NAME> --git URL [--tag T | --branch B | --rev R]\n"
             "  forge add <NAME> --path DIR      [--manifest PATH]\n"
-            "  forge add <NAME> --registry PKG [--version VER | --min-version VER]\n"
+            "  forge add <NAME> --registry PKG [--version VER | --min-version VER |\n"
+            "      --version-range REQ] [--max-version VER]\n"
             "      [--features A,B] [--no-default-features]\n"
             "      git URLs accept https://, ssh://, and git@host:path;\n"
             "      FORGE_ALLOW_UNSAFE_GIT=1 lifts that restriction\n"
@@ -44,6 +45,7 @@ static void print_usage(FILE *stream)
             "Environment:\n"
             "  FORGE_HOME                    dependency cache root (default ~/.forge)\n"
             "  FORGE_REGISTRY_URL            sunn registry for --registry deps\n"
+            "  FORGE_OVERLAYS                local site roots shadowing the registry\n"
             "  FORGE_ALLOW_UNSAFE_REGISTRY=1 permit file:// registry URLs\n"
             "  FORGE_DEBUGGER                debugger executable for `forge debug`\n"
             "  FORGE_ALLOW_UNSAFE_GIT=1      permit local-path/file:// git URLs\n"
@@ -80,11 +82,14 @@ static const ForgeVerbHelp VERB_HELP[] = {
       "state; naming one moves only that dep past its pin. --offline forbids "
       "network access." },
     { "add", "forge add <NAME> (--git URL | --path DIR | --registry PKG) "
-             "[--tag T | --branch B | --rev R] [--version VER | --min-version VER] "
+             "[--tag T | --branch B | --rev R] [--version VER | --min-version VER | "
+             "--version-range REQ] [--max-version VER] "
              "[--features A,B] [--no-default-features] [--manifest PATH]",
       "Insert a dependency into [dependencies]; git URLs must use https://, "
       "ssh://, or git@host:path; --version pins a registry package exactly, "
-      "--min-version sets a minimum, and a bare entry tracks the baseline." },
+      "--min-version sets a minimum, --version-range sets a requirement "
+      "(comparators =, >=, >, <=, <, ^, ~, wildcards, ',' AND, '||' OR), "
+      "--max-version caps it, and a bare entry tracks the baseline." },
     { "remove", "forge remove <NAME> [--manifest PATH]",
       "Remove a dependency from [dependencies] and its lock entry." },
     { "new", "forge new <NAME>",
@@ -312,10 +317,12 @@ static int command_build_like(const char *command, int argc, char **argv)
 }
 
 /* forge add NAME (--git URL | --path DIR | --registry PKG)
- * [--tag T|--branch B|--rev R] [--version VER | --min-version VER]
+ * [--tag T|--branch B|--rev R] [--version VER | --min-version VER |
+ * --version-range REQ] [--max-version VER]
  * [--features A,B] [--no-default-features] [--manifest PATH]. Exactly one
  * source; refs are git-only, versions and features registry-only;
- * --version and --min-version exclude each other. */
+ * --version/--min-version/--version-range exclude each other, --max-version
+ * never combines with --version. */
 static int command_add(int argc, char **argv)
 {
     const char *manifest_path = "Forge.toml";
@@ -325,6 +332,8 @@ static int command_add(int argc, char **argv)
     const char *registry_package = NULL;
     const char *registry_version = "";
     const char *registry_min_version = "";
+    const char *registry_range = "";
+    const char *registry_max_version = "";
     const char *registry_features = "";
     int registry_no_default_features = 0;
     const char *ref_kind = "";
@@ -366,6 +375,16 @@ static int command_add(int argc, char **argv)
                 return 1;
             }
             registry_min_version = argv[++index];
+        } else if (strcmp(argv[index], "--version-range") == 0) {
+            if (flag_value_missing("--version-range", index, argc)) {
+                return 1;
+            }
+            registry_range = argv[++index];
+        } else if (strcmp(argv[index], "--max-version") == 0) {
+            if (flag_value_missing("--max-version", index, argc)) {
+                return 1;
+            }
+            registry_max_version = argv[++index];
         } else if (strcmp(argv[index], "--features") == 0) {
             if (flag_value_missing("--features", index, argc)) {
                 return 1;
@@ -399,15 +418,22 @@ static int command_add(int argc, char **argv)
         }
     }
     discover_manifest(&manifest_path, explicit_manifest, discovered, sizeof(discovered));
-    if (registry_version[0] != '\0' && registry_min_version[0] != '\0') {
+    if ((registry_version[0] != '\0') + (registry_min_version[0] != '\0') +
+        (registry_range[0] != '\0') > 1) {
         fprintf(stderr, "forge: 'add' accepts only one of "
-                        "--version/--min-version\n");
+                        "--version/--min-version/--version-range\n");
+        return 1;
+    }
+    if (registry_max_version[0] != '\0' && registry_version[0] != '\0') {
+        fprintf(stderr, "forge: 'add' --max-version cannot combine with "
+                        "--version\n");
         return 1;
     }
     return forge_orchestrate_add(manifest_path, name, git_url != NULL ? git_url : "",
                                  ref_kind, ref_value, dep_path != NULL ? dep_path : "",
                                  registry_package != NULL ? registry_package : "",
                                  registry_version, registry_min_version,
+                                 registry_range, registry_max_version,
                                  registry_features, registry_no_default_features);
 }
 

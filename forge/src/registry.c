@@ -22,6 +22,520 @@ static int resolve_floor(ForgeLogger *logger, const char *dep_name,
                          unsigned *floor_revision,
                          char *error, size_t error_size);
 
+static int read_response_file(const char *path, char *body, size_t body_size,
+                               char *error, size_t error_size);
+static int resolve_floor(ForgeLogger *logger, const char *dep_name,
+                         const char *base, const char *package,
+                         const char *min_version, const char *tmp_path,
+                         int offline, char *floor_version, size_t floor_size,
+                         unsigned *floor_revision,
+                         char *error, size_t error_size);
+static int registry_list_versions(ForgeLogger *logger, const char *base,
+                                  const char *package, const char *tmp_path,
+                                  char versions[][FORGE_MANIFEST_VALUE_MAX],
+                                  unsigned *revisions, size_t capacity,
+                                  size_t *count, char *error,
+                                  size_t error_size);
+
+/* Forward declarations for JSON helpers + recipe parser defined further
+ * below; overlay/index code above needs them. */
+typedef struct ForgeJsonCursor {
+    const char *text;
+    const char *error;
+} ForgeJsonCursor;
+static void json_skip_space(ForgeJsonCursor *cursor);
+static int json_read_string(ForgeJsonCursor *cursor, char *out,
+                            size_t out_size);
+static int json_skip_value(ForgeJsonCursor *cursor);
+static int json_object_string(ForgeJsonCursor *cursor, const char *wanted,
+                              char *out, size_t out_size, int *is_null);
+static int json_object_uint(ForgeJsonCursor *cursor, const char *wanted,
+                            unsigned *out, unsigned max, int *is_null);
+static int json_array_select(const char *json, const char *array_key,
+                             const char *match_key, const char *match_value,
+                             const char *want_a, char *out_a, size_t a_size,
+                             const char *want_b, char *out_b, size_t b_size);
+static int parse_recipe(const char *body, const char *base,
+                        ForgeRegistryPin *pin, char *error, size_t error_size);
+static int version_text_is_valid(const char *version);
+
+/* ------------------------------------------------------------------ */
+/* Overlays: local site roots that shadow the registry                 */
+/*                                                                     */
+/* FORGE_OVERLAYS names one or more site roots (same static layout as  */
+/* file:// registries: packages/sunn.registry.json +                   */
+/* packages/<name>/<version>.json + tarballs). Separators are ';' on   */
+/* Windows and ':' elsewhere; surrounding spaces are ignored. An       */
+/* overlay wins over the configured registry for both recipe queries   */
+/* and version listings, first overlay wins. Paths that escape the     */
+/* overlay root (..) are refused loudly.                               */
+/* ------------------------------------------------------------------ */
+
+static int overlay_roots(char roots[][FORGE_PATH_MAX], size_t capacity,
+                         size_t *count)
+{
+    const char *env = getenv("FORGE_OVERLAYS");
+#if FORGE_PLATFORM_WINDOWS
+    const char sep = ';';
+#else
+    const char sep = ':';
+#endif
+    const char *p;
+
+    *count = 0U;
+    if (env == NULL || env[0] == '\0') {
+        return 0;
+    }
+    p = env;
+    for (;;) {
+        const char *end;
+        size_t len;
+
+        while (*p == ' ' || *p == '\t') {
+            ++p;
+        }
+        if (*p == '\0') {
+            return 0;
+        }
+        end = strchr(p, sep);
+        len = end != NULL ? (size_t)(end - p) : strlen(p);
+        while (len != 0U && (p[len - 1U] == ' ' || p[len - 1U] == '\t')) {
+            --len;
+        }
+        if (len != 0U) {
+            if (len >= FORGE_PATH_MAX || *count == capacity) {
+                return -1;
+            }
+            memcpy(roots[*count], p, len);
+            roots[*count][len] = '\0';
+            if (strstr(roots[*count], "..") != NULL) {
+                return -1;
+            }
+            ++*count;
+        }
+        if (end == NULL) {
+            return 0;
+        }
+        p = end + 1U;
+    }
+}
+
+/* True when <root>/packages/<package>/<version>.json exists and parses as
+ * a recipe for that package/version; fills pin/defs like the file query. */
+static int overlay_try_recipe(const char *root, const char *package,
+                              const char *version,
+                              ForgeRegistryPin *pin, ForgeFeatureDefs *defs,
+                              char *error, size_t error_size)
+{
+    char path[FORGE_PATH_MAX];
+    char body[65536];
+    FILE *probe;
+
+    if (strchr(package, '/') != NULL || strchr(package, '\\') != NULL ||
+        strstr(package, "..") != NULL || strchr(version, '/') != NULL ||
+        strchr(version, '\\') != NULL || strstr(version, "..") != NULL) {
+        return 0;
+    }
+    if ((size_t)snprintf(path, sizeof(path), "%s/packages/%s/%s.json", root,
+                         package, version) >= sizeof(path)) {
+        return 0;
+    }
+    probe = fopen(path, "rb");
+    if (probe == NULL) {
+        return 0;
+    }
+    (void)fclose(probe);
+    if (read_response_file(path, body, sizeof(body), error, error_size) != 0) {
+        return 0;
+    }
+    if (body[0] != '{') {
+        return 0;
+    }
+    {
+        char base[FORGE_PATH_MAX];
+
+        /* Relative tarball locations inside an overlay resolve against a
+         * file:// view of the overlay root so cached bytes stay local. */
+        if ((size_t)snprintf(base, sizeof(base), "file://%s", root) >=
+            sizeof(base)) {
+            return 0;
+        }
+        if (parse_recipe(body, base, pin, error, error_size) != 0) {
+            return 0;
+        }
+        if (forge_registry_parse_features(body, defs, error,
+                                          error_size) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Index version listing (range resolution)                            */
+/*                                                                     */
+/* Ranges need the full version list, not just latest. Both transports */
+/* expose the same static index shape (packages[] with versions[]), so */
+/* one parser serves file:// roots, overlay roots, and the HTTP index  */
+/* document fetched to tmp_path. Bounded to                              */
+/* FORGE_REGISTRY_MAX_LISTED_VERSIONS entries.                         */
+/* ------------------------------------------------------------------ */
+
+static int index_package_span(const char *body, const char *package,
+                              char *span_out, size_t span_size)
+{
+    ForgeJsonCursor cursor = { body, NULL };
+    int first = 1;
+    int found_array = 0;
+
+    json_skip_space(&cursor);
+    if (*cursor.text != '{') {
+        return -1;
+    }
+    ++cursor.text;
+    for (;;) {
+        char key[128];
+
+        json_skip_space(&cursor);
+        if (*cursor.text == '}') {
+            return 0;
+        }
+        if (!first) {
+            if (*cursor.text != ',') {
+                return -1;
+            }
+            ++cursor.text;
+            json_skip_space(&cursor);
+        }
+        first = 0;
+        if (json_read_string(&cursor, key, sizeof(key)) != 0) {
+            return -1;
+        }
+        json_skip_space(&cursor);
+        if (*cursor.text != ':') {
+            return -1;
+        }
+        ++cursor.text;
+        json_skip_space(&cursor);
+        if (strcmp(key, "packages") == 0) {
+            found_array = 1;
+            break;
+        }
+        if (json_skip_value(&cursor) != 0) {
+            return -1;
+        }
+    }
+    if (!found_array || *cursor.text != '[') {
+        return 0;
+    }
+    ++cursor.text;
+    for (;;) {
+        const char *span_start;
+        size_t span_length;
+        ForgeJsonCursor object;
+        char candidate[FORGE_PATH_MAX];
+        int is_null = 0;
+        int matched;
+
+        json_skip_space(&cursor);
+        if (*cursor.text == ']') {
+            return 0;
+        }
+        if (*cursor.text != '{') {
+            return -1;
+        }
+        span_start = cursor.text;
+        if (json_skip_value(&cursor) != 0) {
+            return -1;
+        }
+        span_length = (size_t)(cursor.text - span_start);
+        if (span_length >= span_size) {
+            return -1;
+        }
+        memcpy(span_out, span_start, span_length);
+        span_out[span_length] = '\0';
+        object.text = span_out;
+        object.error = NULL;
+        matched = json_object_string(&object, "name", candidate,
+                                     sizeof(candidate), &is_null);
+        if (matched < 0) {
+            return -1;
+        }
+        if (matched != 0 && !is_null && strcmp(candidate, package) == 0) {
+            return 1;
+        }
+        json_skip_space(&cursor);
+        if (*cursor.text == ',') {
+            ++cursor.text;
+        }
+    }
+}
+
+static int index_collect_versions(const char *package_span,
+                                  char versions[][FORGE_MANIFEST_VALUE_MAX],
+                                  unsigned *revisions, size_t capacity,
+                                  size_t *count)
+{
+    ForgeJsonCursor cursor = { package_span, NULL };
+    int first = 1;
+
+    *count = 0U;
+    json_skip_space(&cursor);
+    if (*cursor.text != '{') {
+        return -1;
+    }
+    ++cursor.text;
+    for (;;) {
+        char key[128];
+
+        json_skip_space(&cursor);
+        if (*cursor.text == '}') {
+            return 0;
+        }
+        if (!first) {
+            if (*cursor.text != ',') {
+                return -1;
+            }
+            ++cursor.text;
+            json_skip_space(&cursor);
+        }
+        first = 0;
+        if (json_read_string(&cursor, key, sizeof(key)) != 0) {
+            return -1;
+        }
+        json_skip_space(&cursor);
+        if (*cursor.text != ':') {
+            return -1;
+        }
+        ++cursor.text;
+        json_skip_space(&cursor);
+        if (strcmp(key, "versions") != 0) {
+            if (json_skip_value(&cursor) != 0) {
+                return -1;
+            }
+            continue;
+        }
+        if (*cursor.text != '[') {
+            return -1;
+        }
+        ++cursor.text;
+        for (;;) {
+            const char *span_start;
+            char span[1024];
+            size_t span_length;
+            ForgeJsonCursor object;
+            char ver[FORGE_MANIFEST_VALUE_MAX];
+            unsigned rev = 0U;
+            int is_null = 0;
+            int matched;
+
+            json_skip_space(&cursor);
+            if (*cursor.text == ']') {
+                return 0;
+            }
+            if (*cursor.text != '{') {
+                return -1;
+            }
+            span_start = cursor.text;
+            if (json_skip_value(&cursor) != 0) {
+                return -1;
+            }
+            span_length = (size_t)(cursor.text - span_start);
+            if (span_length >= sizeof(span)) {
+                return -1;
+            }
+            memcpy(span, span_start, span_length);
+            span[span_length] = '\0';
+            object.text = span;
+            object.error = NULL;
+            matched = json_object_string(&object, "version", ver,
+                                         sizeof(ver), &is_null);
+            if (matched <= 0 || is_null || ver[0] == '\0') {
+                return -1;
+            }
+            object.text = span;
+            object.error = NULL;
+            matched = json_object_uint(&object, "revision", &rev,
+                                       FORGE_REGISTRY_MAX_REVISION,
+                                       &is_null);
+            if (matched < 0) {
+                return -1;
+            }
+            if (*count < capacity) {
+                (void)snprintf(versions[*count], FORGE_MANIFEST_VALUE_MAX,
+                               "%s", ver);
+                revisions[*count] = (matched > 0 && !is_null) ? rev : 0U;
+                ++*count;
+            }
+            json_skip_space(&cursor);
+            if (*cursor.text == ',') {
+                ++cursor.text;
+            }
+        }
+    }
+}
+
+static int registry_list_versions(ForgeLogger *logger, const char *base,
+                                  const char *package, const char *tmp_path,
+                                  char versions[][FORGE_MANIFEST_VALUE_MAX],
+                                  unsigned *revisions, size_t capacity,
+                                  size_t *count, char *error,
+                                  size_t error_size)
+{
+    char body[65536];
+    char span[16384];
+    int found;
+
+    *count = 0U;
+    /* Overlays first: first overlay naming the package wins. */
+    {
+        char roots[FORGE_REGISTRY_MAX_OVERLAYS][FORGE_PATH_MAX];
+        size_t nroots = 0U;
+        size_t i;
+
+        if (overlay_roots(roots, FORGE_REGISTRY_MAX_OVERLAYS, &nroots) != 0) {
+            forge_util_set_error(error, error_size,
+                      "FORGE_OVERLAYS names a path that is too long or "
+                      "escapes with '..'");
+            return -1;
+        }
+        for (i = 0U; i < nroots; ++i) {
+            char path[FORGE_PATH_MAX];
+
+            if ((size_t)snprintf(path, sizeof(path),
+                                 "%s/packages/sunn.registry.json",
+                                 roots[i]) >= sizeof(path)) {
+                continue;
+            }
+            {
+                FILE *probe = fopen(path, "rb");
+
+                if (probe == NULL) {
+                    continue;
+                }
+                (void)fclose(probe);
+            }
+            if (read_response_file(path, body, sizeof(body), error,
+                                   error_size) != 0) {
+                continue;
+            }
+            if (body[0] != '{') {
+                continue;
+            }
+            found = index_package_span(body, package, span, sizeof(span));
+            if (found > 0 &&
+                index_collect_versions(span, versions, revisions, capacity,
+                                       count) == 0 &&
+                *count != 0U) {
+                return 0;
+            }
+        }
+    }
+    if (strncmp(base, "file://", 7U) == 0) {
+        char root[FORGE_PATH_MAX];
+        char path[FORGE_PATH_MAX];
+        const char *dir = base + 7U;
+
+        if (dir[0] != '/') {
+            forge_util_set_error(error, error_size,
+                      "file:// registries must point at a local directory "
+                      "(file:///path); host shares are not supported");
+            return -1;
+        }
+        if ((size_t)snprintf(root, sizeof(root), "%s", dir) >= sizeof(root)) {
+            forge_util_set_error(error, error_size, "registry path is too long");
+            return -1;
+        }
+        if (root[0] == '/' && isalpha((unsigned char)root[1]) &&
+            root[2] == ':') {
+            memmove(root, root + 1U, strlen(root));
+        }
+        if ((size_t)snprintf(path, sizeof(path),
+                             "%s/packages/sunn.registry.json", root) >=
+            sizeof(path)) {
+            forge_util_set_error(error, error_size, "registry path is too long");
+            return -1;
+        }
+        if (read_response_file(path, body, sizeof(body), error,
+                               error_size) != 0) {
+            return -1;
+        }
+    } else {
+        char url[FORGE_PATH_MAX * 2U];
+        int written = snprintf(url, sizeof(url), "%s/packages/sunn.registry.json",
+                               base);
+
+        if (written < 0 || (size_t)written >= sizeof(url)) {
+            forge_util_set_error(error, error_size, "registry query URL is too long");
+            return -1;
+        }
+        if (forge_fetch_url_is_supported(url, error, error_size) != 0 ||
+            forge_fetch_to_file(logger, url, tmp_path, error, error_size) != 0 ||
+            read_response_file(tmp_path, body, sizeof(body), error,
+                               error_size) != 0) {
+            return -1;
+        }
+    }
+    if (body[0] != '{') {
+        forge_util_set_error(error, error_size,
+                  "registry index for '%s' is not valid JSON", package);
+        return -1;
+    }
+    found = index_package_span(body, package, span, sizeof(span));
+    if (found < 0) {
+        forge_util_set_error(error, error_size,
+                  "registry index for '%s' is not valid JSON", package);
+        return -1;
+    }
+    if (found == 0) {
+        forge_util_set_error(error, error_size, "registry has no package '%s'",
+                  package);
+        return -1;
+    }
+    if (index_collect_versions(span, versions, revisions, capacity, count) != 0) {
+        forge_util_set_error(error, error_size,
+                  "registry index for '%s' is not valid JSON", package);
+        return -1;
+    }
+    if (*count == 0U) {
+        forge_util_set_error(error, error_size,
+                  "registry has no versions for '%s'", package);
+        return -1;
+    }
+    return 0;
+}
+
+/* Sorts versions descending (newest first), revisions breaking ties. */
+static void sort_versions_desc(char versions[][FORGE_MANIFEST_VALUE_MAX],
+                               unsigned *revisions, size_t count)
+{
+    size_t i;
+    size_t j;
+
+    for (i = 1U; i < count; ++i) {
+        char held_v[FORGE_MANIFEST_VALUE_MAX];
+        unsigned held_r = revisions[i];
+        size_t at = i;
+
+        (void)snprintf(held_v, sizeof(held_v), "%s", versions[i]);
+        while (at > 0U) {
+            int order = forge_version_compare(held_v, versions[at - 1U]);
+
+            if (order < 0 ||
+                (order == 0 && held_r <= revisions[at - 1U])) {
+                break;
+            }
+            memmove(versions[at], versions[at - 1U],
+                    sizeof(versions[at]));
+            revisions[at] = revisions[at - 1U];
+            --at;
+        }
+        memmove(versions[at], held_v, sizeof(versions[at]));
+        revisions[at] = held_r;
+        (void)j;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Base URL + host triplet                                             */
 /* ------------------------------------------------------------------ */
@@ -36,6 +550,12 @@ int forge_registry_base_url(char *base_out, size_t base_size,
         forge_util_set_error(error, error_size,
                   "registry dependencies need FORGE_REGISTRY_URL to point "
                   "at a sunn registry (e.g. FORGE_REGISTRY_URL=https://sunn.local)");
+        return -1;
+    }
+    if (strncmp(base, "git+", 4U) == 0) {
+        forge_util_set_error(error, error_size,
+                  "git registries are not served yet (version history lives "
+                  "in the static index); use FORGE_OVERLAYS for local ports");
         return -1;
     }
     length = strlen(base);
@@ -225,6 +745,8 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
                                const char *package,
                                const char *wanted_version,
                                const char *min_version,
+                               const char *range,
+                               const char *max_version,
                                const char *declared_features,
                                int use_defaults,
                                const char *lock_version, const char *lock_kind,
@@ -253,6 +775,8 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
     char identity[FORGE_PATH_MAX * 2U];
     int query_latest;
     int min_given = min_version != NULL && min_version[0] != '\0';
+    int range_given = range != NULL && range[0] != '\0';
+    int max_given = max_version != NULL && max_version[0] != '\0';
 
     if (pin == NULL || reused == NULL || defs == NULL) {
         forge_util_set_error(error, error_size, "registry materialize needs a pin, feature definitions, and reuse flag");
@@ -273,9 +797,55 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
     }
     query_latest = 0;
     floor_version[0] = '\0';
+    if (range_given && !forge_version_range_is_valid(range)) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s': version-range '%s' is not valid",
+                  dep_name != NULL ? dep_name : package, range);
+        return -1;
+    }
+    if (max_given && !version_text_is_valid(max_version)) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s': max-version '%s' is not a valid version",
+                  dep_name != NULL ? dep_name : package, max_version);
+        return -1;
+    }
     if (wanted_version != NULL && wanted_version[0] != '\0') {
         /* Exact pins name their bytes outright and bypass the baseline. */
         (void)snprintf(version, sizeof(version), "%s", wanted_version);
+    } else if ((range_given || max_given) && !force_update &&
+               lock_version != NULL && lock_version[0] != '\0') {
+        /*
+         * Locked range/max reuse: a pin that already satisfies every
+         * constraint stays put without touching the network. The
+         * baseline still floors fresh resolutions below; it never
+         * ambushes a locked build, so only enforce it when the lock
+         * predates the floor check via resolve_floor when needed.
+         */
+        int lock_ok = 1;
+
+        if (range_given && !forge_version_satisfies(lock_version, range)) {
+            lock_ok = 0;
+        }
+        if (lock_ok && max_given &&
+            forge_version_compare(lock_version, max_version) > 0) {
+            lock_ok = 0;
+        }
+        if (lock_ok && min_given &&
+            forge_version_compare(lock_version, min_version) < 0) {
+            lock_ok = 0;
+        }
+        if (lock_ok) {
+            (void)snprintf(version, sizeof(version), "%s", lock_version);
+        } else {
+            version[0] = '\0';
+            query_latest = 2; /* range/max re-pick below */
+        }
+    } else if ((range_given || max_given) && force_update) {
+        version[0] = '\0';
+        query_latest = 2; /* range/max re-pick below */
+    } else if ((range_given || max_given)) {
+        version[0] = '\0';
+        query_latest = 2; /* fresh range/max re-pick below */
     } else if (force_update && !min_given) {
         /*
          * Bare update: track newest. The baseline floors fresh
@@ -312,6 +882,76 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
         } else {
             (void)snprintf(version, sizeof(version), "%s", floor_version);
         }
+    }
+    if (query_latest == 2) {
+        /*
+         * Range/max resolution: list every indexed release newest-first
+         * and take the first entry satisfying the range, the manifest
+         * minimum, the baseline floor, and the inclusive maximum.
+         * Exact pins never reach here; bare/minimum entries never set
+         * query_latest=2 above.
+         */
+        static char listed[FORGE_REGISTRY_MAX_LISTED_VERSIONS][FORGE_MANIFEST_VALUE_MAX];
+        static unsigned listed_rev[FORGE_REGISTRY_MAX_LISTED_VERSIONS];
+        size_t nlisted = 0U;
+        size_t i;
+        int picked = 0;
+
+        (void)snprintf(resolve_tmp, sizeof(resolve_tmp), "%s/.resolve.json.tmp",
+                       package_dir);
+        if (resolve_floor(logger, dep_name, base, package,
+                          min_given ? min_version : "", resolve_tmp, offline,
+                          floor_version, sizeof(floor_version),
+                          &floor_revision, error, error_size) != 0) {
+            return -1;
+        }
+        if (offline && (lock_version == NULL || lock_version[0] == '\0')) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s' is not cached and --offline forbids fetching it",
+                      dep_name != NULL ? dep_name : package);
+            return -1;
+        }
+        if (registry_list_versions(logger, base, package, resolve_tmp,
+                                   listed, listed_rev,
+                                   FORGE_REGISTRY_MAX_LISTED_VERSIONS,
+                                   &nlisted, error, error_size) != 0) {
+            return -1;
+        }
+        sort_versions_desc(listed, listed_rev, nlisted);
+        for (i = 0U; i < nlisted; ++i) {
+            if (range_given && !forge_version_satisfies(listed[i], range)) {
+                continue;
+            }
+            if (min_given &&
+                forge_version_compare(listed[i], min_version) < 0) {
+                continue;
+            }
+            if (max_given &&
+                forge_version_compare(listed[i], max_version) > 0) {
+                continue;
+            }
+            if (floor_version[0] != '\0') {
+                int order = forge_version_compare(listed[i], floor_version);
+
+                if (order < 0) {
+                    continue;
+                }
+            }
+            (void)snprintf(version, sizeof(version), "%s", listed[i]);
+            picked = 1;
+            break;
+        }
+        if (!picked) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': no registry release satisfies '%s%s%s%s'",
+                      dep_name != NULL ? dep_name : package,
+                      range_given ? range : "",
+                      (range_given && max_given) ? ", " : "",
+                      max_given ? "<=" : "",
+                      max_given ? max_version : "");
+            return -1;
+        }
+        query_latest = 0;
     }
     if (version[0] != '\0') {
         size_t suffix_length = strlen(feature_suffix);
@@ -415,6 +1055,21 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
     }
     if (forge_registry_query(logger, package, version, resolve_tmp, pin, defs,
                              error, error_size) != 0) return -1;
+    if (range_given && !forge_version_satisfies(pin->version, range)) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s': registry release %s does not satisfy "
+                  "version-range '%s'",
+                  dep_name != NULL ? dep_name : package, pin->version,
+                  range);
+        return -1;
+    }
+    if (max_given && forge_version_compare(pin->version, max_version) > 0) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s': registry release %s exceeds max-version %s",
+                  dep_name != NULL ? dep_name : package, pin->version,
+                  max_version);
+        return -1;
+    }
     if (query_latest && floor_version[0] != '\0' &&
         (forge_version_compare(pin->version, floor_version) < 0 ||
          (forge_version_compare(pin->version, floor_version) == 0 &&
@@ -616,10 +1271,7 @@ static int sha256_text_is_valid(const char *text)
 /* truncation, wrong types, \u escapes — fails instead of guessing.    */
 /* ------------------------------------------------------------------ */
 
-typedef struct ForgeJsonCursor {
-    const char *text;
-    const char *error;
-} ForgeJsonCursor;
+/* (ForgeJsonCursor forward-declared at the top of this file.) */
 
 static void json_skip_space(ForgeJsonCursor *cursor)
 {
@@ -1124,6 +1776,8 @@ static int parse_feature_dep(const char *span, ForgeFeatureDef *def,
     char package[FORGE_MANIFEST_VALUE_MAX];
     char version[FORGE_MANIFEST_VALUE_MAX] = { 0 };
     char min_version[FORGE_MANIFEST_VALUE_MAX] = { 0 };
+    char range[FORGE_VERSION_RANGE_MAX] = { 0 };
+    char max_version[FORGE_MANIFEST_VALUE_MAX] = { 0 };
     int is_null = 0;
     int found;
     ForgeFeatureDep *slot;
@@ -1166,17 +1820,55 @@ static int parse_feature_dep(const char *span, ForgeFeatureDef *def,
                   "minimum version", def->name);
         return -1;
     }
-    if (version[0] != '\0' && min_version[0] != '\0') {
+    object.text = span;
+    object.error = NULL;
+    found = json_object_string(&object, "version-range", range,
+                               sizeof(range), &is_null);
+    if (found < 0 || (found > 0 && !is_null &&
+                      !forge_version_range_is_valid(range))) {
         forge_util_set_error(error, error_size,
-                  "recipe feature '%s' dependency '%s' pins both version "
-                  "and min-version", def->name, package);
+                  "recipe feature '%s' has a dependency without a usable "
+                  "version-range", def->name);
         return -1;
+    }
+    object.text = span;
+    object.error = NULL;
+    found = json_object_string(&object, "max-version", max_version,
+                               sizeof(max_version), &is_null);
+    if (found < 0 || (found > 0 && !is_null &&
+                      !version_text_is_valid(max_version))) {
+        forge_util_set_error(error, error_size,
+                  "recipe feature '%s' has a dependency without a usable "
+                  "max-version", def->name);
+        return -1;
+    }
+    {
+        int pins = (version[0] != '\0') + (min_version[0] != '\0') +
+                   (range[0] != '\0');
+
+        if (pins > 1) {
+            forge_util_set_error(error, error_size,
+                      "recipe feature '%s' dependency '%s' pins more than "
+                      "one of version, min-version, version-range",
+                      def->name, package);
+            return -1;
+        }
+        if (max_version[0] != '\0' && version[0] != '\0') {
+            forge_util_set_error(error, error_size,
+                      "recipe feature '%s' dependency '%s' combines "
+                      "max-version with an exact version", def->name,
+                      package);
+            return -1;
+        }
     }
     slot = &def->deps[def->dep_count++];
     (void)snprintf(slot->package, sizeof(slot->package), "%s", package);
     (void)snprintf(slot->version, sizeof(slot->version), "%s", version);
     (void)snprintf(slot->min_version, sizeof(slot->min_version), "%s",
                    min_version);
+    (void)snprintf(slot->range, sizeof(slot->range), "%s", range);
+    (void)snprintf(slot->max_version, sizeof(slot->max_version), "%s",
+                   max_version);
     return 0;
 }
 
@@ -2218,6 +2910,73 @@ int forge_registry_query(ForgeLogger *logger, const char *package,
     }
     if (forge_registry_base_url(base, sizeof(base), error, error_size) != 0) {
         return -1;
+    }
+    /* Overlays shadow every transport: first overlay naming the recipe
+     * wins, so local patches and proprietary ports resolve without a
+     * registry round-trip. */
+    {
+        char roots[FORGE_REGISTRY_MAX_OVERLAYS][FORGE_PATH_MAX];
+        size_t nroots = 0U;
+        size_t i;
+
+        if (overlay_roots(roots, FORGE_REGISTRY_MAX_OVERLAYS, &nroots) != 0) {
+            forge_util_set_error(error, error_size,
+                      "FORGE_OVERLAYS names a path that is too long or "
+                      "escapes with '..'");
+            return -1;
+        }
+        for (i = 0U; i < nroots; ++i) {
+            if (version != NULL && version[0] != '\0') {
+                ForgeRegistryPin over = {0};
+                ForgeFeatureDefs odefs = {0};
+
+                if (overlay_try_recipe(roots[i], package, version, &over,
+                                       &odefs, error, error_size)) {
+                    *pin = over;
+                    *defs = odefs;
+                    return 0;
+                }
+            } else {
+                char path[FORGE_PATH_MAX];
+                char index_body[65536];
+                char latest[FORGE_MANIFEST_VALUE_MAX];
+                char index_ptr[FORGE_PATH_MAX];
+                FILE *probe;
+
+                if ((size_t)snprintf(path, sizeof(path),
+                                     "%s/packages/sunn.registry.json",
+                                     roots[i]) >= sizeof(path)) {
+                    continue;
+                }
+                probe = fopen(path, "rb");
+                if (probe == NULL) {
+                    continue;
+                }
+                (void)fclose(probe);
+                if (read_response_file(path, index_body, sizeof(index_body),
+                                       error, error_size) != 0) {
+                    continue;
+                }
+                if (index_body[0] != '{') {
+                    continue;
+                }
+                if (json_array_select(index_body, "packages", "name",
+                                      package, "latest", latest,
+                                      sizeof(latest), "index", index_ptr,
+                                      sizeof(index_ptr)) > 0) {
+                    ForgeRegistryPin over = {0};
+                    ForgeFeatureDefs odefs = {0};
+
+                    if (overlay_try_recipe(roots[i], package, latest,
+                                           &over, &odefs, error,
+                                           error_size)) {
+                        *pin = over;
+                        *defs = odefs;
+                        return 0;
+                    }
+                }
+            }
+        }
     }
     if (strncmp(base, "file://", 7U) == 0) {
         /* Static layout: no query strings exist for files. */

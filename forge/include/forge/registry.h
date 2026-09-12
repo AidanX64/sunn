@@ -13,6 +13,17 @@
 
 /* A registry recipe describes upstream source; it is not an artifact host. */
 
+/* Maximum versions consulted when picking the newest entry satisfying
+ * a version-range (bounded so a hostile index cannot force unbounded
+ * queries; indexes themselves cap at 1000 in lib/sunn-registry.ts). */
+#define FORGE_REGISTRY_MAX_LISTED_VERSIONS 256U
+
+/* Overlay search path: colon-separated on POSIX, semicolon-separated on
+ * Windows (FORGE_OVERLAYS), plus per-invocation --overlay dirs. Entries
+ * point at site roots with the same static layout as file:// registries
+ * (packages/sunn.registry.json + packages/<name>/<ver>.json). */
+#define FORGE_REGISTRY_MAX_OVERLAYS 16U
+
 /* Recipe revisions share the registry schema's bound (lib/sunn-registry.ts). */
 #define FORGE_REGISTRY_MAX_REVISION 1000000U
 
@@ -28,6 +39,8 @@ typedef struct ForgeFeatureDep {
     char package[FORGE_MANIFEST_VALUE_MAX];
     char version[FORGE_MANIFEST_VALUE_MAX];
     char min_version[FORGE_MANIFEST_VALUE_MAX];
+    char range[FORGE_VERSION_RANGE_MAX];
+    char max_version[FORGE_MANIFEST_VALUE_MAX];
 } ForgeFeatureDep;
 
 typedef struct ForgeFeatureDef {
@@ -113,7 +126,9 @@ int forge_features_effective(const ForgeFeatureDefs *defs,
  * `dep_name` is the local [dependencies] name (used in user-facing errors);
  * `package` the registry package. `wanted_version` names an exact pin (""
  * when the entry floats); `min_version` names a manifest minimum ("" when
- * the entry is exact or bare). `declared_features` carries the canonical
+ * the entry is exact or bare); `range` names a version-range requirement
+ * ("" when none, exclusive with exact/minimum); `max_version` names an
+ * inclusive upper bound ("" when none, never with exact). `declared_features` carries the canonical
  * comma-joined requested features ("" when none) with `use_defaults`
  * saying whether recipe defaults apply; the cache directory separates on
  * that spelling while `defs` receives the recipe's feature definitions
@@ -132,6 +147,8 @@ int forge_registry_materialize(ForgeLogger *logger, const char *dep_name,
                                const char *package,
                                const char *wanted_version,
                                const char *min_version,
+                               const char *range,
+                               const char *max_version,
                                const char *declared_features,
                                int use_defaults,
                                const char *lock_version, const char *lock_kind,

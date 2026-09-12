@@ -43,19 +43,45 @@ const featureNameSchema = z
   .max(32)
   .regex(/^[A-Za-z0-9_-]+$/, "invalid feature name")
 
+// Version-range requirement grammar (mirrors forge's C parser in
+// src/manifest.c): comparators =, >=, >, <=, <, ^, ~, wildcards x/X/*,
+// comma for AND, || for OR. Tight charset so a tampered recipe fails
+// closed at parse time; semantic validity is checked client-side.
+export const versionRangeSchema = z
+  .string()
+  .min(1)
+  .max(512)
+  .regex(
+    /^[A-Za-z0-9.+*^~<>=|, \t-]+$/,
+    "version-range uses comparators =, >=, >, <=, <, ^, ~, wildcards, ',' and '||'"
+  )
+
 // Optional transitive dependencies switched on by a feature.
 // Registry-only (like the top-level `dependencies` names, which stay
-// bare for backwards compatibility); at most one of version/min-version,
-// neither meaning the baseline.
+// bare for backwards compatibility); at most one of
+// version/min-version/version-range, neither meaning the baseline;
+// max-version caps the range but never combines with an exact version.
 const featureDepSchema = z
   .object({
     registry: packageNameSchema,
     version: packageVersionSchema.optional(),
     "min-version": packageVersionSchema.optional(),
+    "version-range": versionRangeSchema.optional(),
+    "max-version": packageVersionSchema.optional(),
   })
   .strict()
-  .refine((d) => d.version === undefined || d["min-version"] === undefined, {
-    message: "feature dependency takes at most one of version/min-version",
+  .refine(
+    (d) =>
+      [d.version, d["min-version"], d["version-range"]].filter(
+        (v) => v !== undefined
+      ).length <= 1,
+    {
+      message:
+        "feature dependency takes at most one of version/min-version/version-range",
+    }
+  )
+  .refine((d) => d.version === undefined || d["max-version"] === undefined, {
+    message: "feature dependency max-version cannot combine with version",
   })
 
 const featureSchema = z

@@ -54,6 +54,10 @@ typedef struct ForgeLockEntry {
     char location[FORGE_PATH_MAX];
     unsigned revision;
     char features[FORGE_FEATURES_JOINED_MAX];
+    /* Registry requirement spelling that produced this pin (version-range
+     * or min/max text); "" for exact/bare and for locks predating ranges.
+     * Informational for humans; resolution re-reads the manifest. */
+    char requirement[FORGE_VERSION_RANGE_MAX];
 } ForgeLockEntry;
 
 typedef struct ForgeLockFile {
@@ -788,6 +792,12 @@ static int write_lockfile_body(void *user_data, FILE *file)
                         entry->features) < 0) {
                 return -1;
             }
+            if (entry->requirement[0] != '\0') {
+                if (fprintf(file, "# requirement %s: %s\n", entry->name,
+                            entry->requirement) < 0) {
+                    return -1;
+                }
+            }
         }
     }
     return 0;
@@ -1092,6 +1102,11 @@ typedef struct ForgeResolveContext {
     /* When non-empty, only this dependency is re-resolved past its lock pin
      * (`forge update <name>`); every other dep keeps its locked commit. */
     char force_update_name[FORGE_MANIFEST_VALUE_MAX];
+    /* Top-level [overrides] copied at resolve entry; transitive manifests
+     * never define their own (rejected at parse time by scoping them to
+     * the root manifest passed to forge_deps_resolve). */
+    ForgeOverride overrides[FORGE_MANIFEST_MAX_OVERRIDES];
+    size_t override_count;
     ForgeDepGraph *graph;
     ForgeLogger *logger;
     char error[FORGE_COMMAND_MAX];
@@ -1111,6 +1126,10 @@ static ForgeDepNode *graph_find_node(ForgeDepGraph *graph, const char *name)
     }
     return NULL;
 }
+
+/* Top-level [overrides] are carried in the resolve context (see
+ * ForgeResolveContext); lookup happens inline in resolve_recursive so
+ * transitive manifests stay override-free. */
 
 /* ------------------------------------------------------------------ */
 /* Path containment (S3)                                               */
@@ -1243,6 +1262,40 @@ static int dep_identity_conflicts(const ForgeDepNode *node,
                   dependency_is_git ? dependency->git_url : dependency->path);
         return -1;
     }
+    /* Foreign-build tuning is part of identity: same source built with
+     * different configure args is a divergent diamond, like features. */
+    {
+        size_t bi;
+
+        if (node->cmake_arg_count != dependency->cmake_arg_count ||
+            node->make_arg_count != dependency->make_arg_count ||
+            strcmp(node->cmake_toolchain,
+                   dependency->cmake_toolchain) != 0 ||
+            strcmp(node->make_target, dependency->make_target) != 0) {
+            forge_util_set_error(reason, reason_size,
+                      "build arguments differ for '%s'",
+                      dependency->name);
+            return -1;
+        }
+        for (bi = 0U; bi < node->cmake_arg_count; ++bi) {
+            if (strcmp(node->cmake_args[bi],
+                       dependency->cmake_args[bi]) != 0) {
+                forge_util_set_error(reason, reason_size,
+                          "cmake-args differ for '%s'",
+                          dependency->name);
+                return -1;
+            }
+        }
+        for (bi = 0U; bi < node->make_arg_count; ++bi) {
+            if (strcmp(node->make_args[bi],
+                       dependency->make_args[bi]) != 0) {
+                forge_util_set_error(reason, reason_size,
+                          "make-args differ for '%s'",
+                          dependency->name);
+                return -1;
+            }
+        }
+    }
     if (node->is_registry) {
         if (strcmp(node->source_url, dependency->registry) != 0) {
             forge_util_set_error(reason, reason_size,
@@ -1261,17 +1314,42 @@ static int dep_identity_conflicts(const ForgeDepNode *node,
                           dependency->registry_version);
                 return -1;
             }
-        } else if (dependency->registry_min_version[0] != '\0' &&
-            (node->resolved_version[0] == '\0' ||
-             forge_version_compare(node->resolved_version,
-                                   dependency->registry_min_version) < 0)) {
-            forge_util_set_error(reason, reason_size,
-                      "registry version '%s' is below the required minimum "
-                      "'%s'",
-                      node->resolved_version[0] != '\0' ?
-                          node->resolved_version : "<latest>",
-                      dependency->registry_min_version);
-            return -1;
+        } else {
+            if (dependency->registry_min_version[0] != '\0' &&
+                (node->resolved_version[0] == '\0' ||
+                 forge_version_compare(node->resolved_version,
+                                       dependency->registry_min_version) < 0)) {
+                forge_util_set_error(reason, reason_size,
+                          "registry version '%s' is below the required minimum "
+                          "'%s'",
+                          node->resolved_version[0] != '\0' ?
+                              node->resolved_version : "<latest>",
+                          dependency->registry_min_version);
+                return -1;
+            }
+            if (dependency->registry_range[0] != '\0' &&
+                (node->resolved_version[0] == '\0' ||
+                 !forge_version_satisfies(node->resolved_version,
+                                          dependency->registry_range))) {
+                forge_util_set_error(reason, reason_size,
+                          "registry version '%s' does not satisfy "
+                          "version-range '%s'",
+                          node->resolved_version[0] != '\0' ?
+                              node->resolved_version : "<latest>",
+                          dependency->registry_range);
+                return -1;
+            }
+            if (dependency->registry_max_version[0] != '\0' &&
+                (node->resolved_version[0] == '\0' ||
+                 forge_version_compare(node->resolved_version,
+                                       dependency->registry_max_version) > 0)) {
+                forge_util_set_error(reason, reason_size,
+                          "registry version '%s' exceeds max-version '%s'",
+                          node->resolved_version[0] != '\0' ?
+                              node->resolved_version : "<latest>",
+                          dependency->registry_max_version);
+                return -1;
+            }
         }
         /*
          * Feature sets compare on effective spelling: the later
@@ -1454,6 +1532,11 @@ static int apply_features(ForgeManifest *parsed, const ForgeFeatureDefs *defs,
             (void)snprintf(dst->registry_min_version,
                            sizeof(dst->registry_min_version), "%s",
                            want->min_version);
+            (void)snprintf(dst->registry_range, sizeof(dst->registry_range),
+                           "%s", want->range);
+            (void)snprintf(dst->registry_max_version,
+                           sizeof(dst->registry_max_version), "%s",
+                           want->max_version);
             dst->default_features = 1;
         }
     }
@@ -1781,22 +1864,109 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                           "out of memory while resolving dependencies");
                 return -1;
             }
-            fetch_status = forge_registry_materialize(
-                context->logger, dependency->name, dependency->registry,
-                dependency->registry_version,
-                dependency->registry_min_version,
-                declared_joined, dependency->default_features,
-                locked != NULL ? locked->version : "",
-                locked != NULL ? locked->kind : "",
-                locked != NULL ? locked->location : "",
-                locked != NULL ? locked->ref : "",
-                locked != NULL ? locked->commit : "",
-                locked != NULL ? locked->sha256 : "",
-                locked != NULL ? locked->revision : 0U,
-                locked != NULL ? locked->features : "",
-                dep_force, context->offline, package_dir,
-                root, sizeof(root), &pin, defs, &reused,
-                context->error, sizeof(context->error));
+            /* Root [overrides] force one exact version: they win over any
+             * floating requirement but must agree with exact pins and
+             * satisfy range/min/max when those are also declared. */
+            {
+                const char *forced = "";
+                size_t oi;
+
+                for (oi = 0U; oi < context->override_count; ++oi) {
+                    if (strcmp(context->overrides[oi].name,
+                               dependency->registry) == 0) {
+                        forced = context->overrides[oi].version;
+                        break;
+                    }
+                }
+                if (forced[0] != '\0') {
+                    if (dependency->registry_version[0] != '\0' &&
+                        strcmp(dependency->registry_version, forced) != 0) {
+                        cache_gate_release(&gate);
+                        free(defs);
+                        forge_util_set_error(context->error,
+                                  sizeof(context->error),
+                                  "dependency '%s': override forces '%s' but "
+                                  "the manifest pins '%s'",
+                                  dependency->name, forced,
+                                  dependency->registry_version);
+                        return -1;
+                    }
+                    if (dependency->registry_range[0] != '\0' &&
+                        !forge_version_satisfies(forced,
+                                                 dependency->registry_range)) {
+                        cache_gate_release(&gate);
+                        free(defs);
+                        forge_util_set_error(context->error,
+                                  sizeof(context->error),
+                                  "dependency '%s': override '%s' does not "
+                                  "satisfy version-range '%s'",
+                                  dependency->name, forced,
+                                  dependency->registry_range);
+                        return -1;
+                    }
+                    if (dependency->registry_min_version[0] != '\0' &&
+                        forge_version_compare(
+                            forced,
+                            dependency->registry_min_version) < 0) {
+                        cache_gate_release(&gate);
+                        free(defs);
+                        forge_util_set_error(context->error,
+                                  sizeof(context->error),
+                                  "dependency '%s': override '%s' is below "
+                                  "min-version '%s'", dependency->name,
+                                  forced, dependency->registry_min_version);
+                        return -1;
+                    }
+                    if (dependency->registry_max_version[0] != '\0' &&
+                        forge_version_compare(
+                            forced,
+                            dependency->registry_max_version) > 0) {
+                        cache_gate_release(&gate);
+                        free(defs);
+                        forge_util_set_error(context->error,
+                                  sizeof(context->error),
+                                  "dependency '%s': override '%s' exceeds "
+                                  "max-version '%s'", dependency->name,
+                                  forced, dependency->registry_max_version);
+                        return -1;
+                    }
+                    fetch_status = forge_registry_materialize(
+                        context->logger, dependency->name,
+                        dependency->registry, forced, "", "", "",
+                        declared_joined, dependency->default_features,
+                        locked != NULL ? locked->version : "",
+                        locked != NULL ? locked->kind : "",
+                        locked != NULL ? locked->location : "",
+                        locked != NULL ? locked->ref : "",
+                        locked != NULL ? locked->commit : "",
+                        locked != NULL ? locked->sha256 : "",
+                        locked != NULL ? locked->revision : 0U,
+                        locked != NULL ? locked->features : "",
+                        dep_force, context->offline, package_dir,
+                        root, sizeof(root), &pin, defs, &reused,
+                        context->error, sizeof(context->error));
+                } else {
+                    fetch_status = forge_registry_materialize(
+                        context->logger, dependency->name,
+                        dependency->registry,
+                        dependency->registry_version,
+                        dependency->registry_min_version,
+                        dependency->registry_range,
+                        dependency->registry_max_version,
+                        declared_joined, dependency->default_features,
+                        locked != NULL ? locked->version : "",
+                        locked != NULL ? locked->kind : "",
+                        locked != NULL ? locked->location : "",
+                        locked != NULL ? locked->ref : "",
+                        locked != NULL ? locked->commit : "",
+                        locked != NULL ? locked->sha256 : "",
+                        locked != NULL ? locked->revision : 0U,
+                        locked != NULL ? locked->features : "",
+                        dep_force, context->offline, package_dir,
+                        root, sizeof(root), &pin, defs, &reused,
+                        context->error, sizeof(context->error));
+                }
+            }
             cache_gate_release(&gate);
             if (fetch_status != 0) {
                 free(defs);
@@ -1886,6 +2056,47 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                 (void)snprintf(locked->features, sizeof(locked->features), "%s",
                                effective_features);
                 context->lock_dirty = 1;
+            }
+            /* Human-readable requirement that produced this pin. */
+            {
+                char req[FORGE_VERSION_RANGE_MAX] = {0};
+
+                if (dependency->registry_range[0] != '\0') {
+                    (void)snprintf(req, sizeof(req), "%s",
+                                   dependency->registry_range);
+                } else if (dependency->registry_min_version[0] != '\0' &&
+                           dependency->registry_max_version[0] != '\0') {
+                    size_t lo_len = strlen(dependency->registry_min_version);
+                    size_t hi_len = strlen(dependency->registry_max_version);
+
+                    if (lo_len < 100U && hi_len < 100U) {
+                        size_t pos = 0U;
+
+                        memcpy(req + pos, ">=", 2U);
+                        pos += 2U;
+                        memcpy(req + pos, dependency->registry_min_version,
+                               lo_len);
+                        pos += lo_len;
+                        memcpy(req + pos, ", <=", 4U);
+                        pos += 4U;
+                        memcpy(req + pos, dependency->registry_max_version,
+                               hi_len);
+                        pos += hi_len;
+                        req[pos] = '\0';
+                    }
+                } else if (dependency->registry_min_version[0] != '\0') {
+                    (void)snprintf(req, sizeof(req), ">=%s",
+                                   dependency->registry_min_version);
+                } else if (dependency->registry_max_version[0] != '\0') {
+                    (void)snprintf(req, sizeof(req), "<=%s",
+                                   dependency->registry_max_version);
+                }
+                if (strcmp(locked->requirement, req) != 0) {
+                    (void)snprintf(locked->requirement,
+                                   sizeof(locked->requirement), "%s", req);
+                    /* Requirement comments are informational; they do not
+                     * dirty the lock for --locked purposes. */
+                }
             }
             is_native = dir_has_file(root, "Forge.toml");
             /*
@@ -2030,6 +2241,16 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                 free(defs);
                 return -1;
             }
+            /* [overrides] are root-only: a cached dependency shipping its
+             * own overrides would silently re-pin the whole graph. */
+            if (parsed->override_count != 0U) {
+                forge_util_set_error(context->error, sizeof(context->error),
+                          "dependency '%s': [overrides] are only allowed in "
+                          "the top-level Forge.toml", dependency->name);
+                free(parsed);
+                free(defs);
+                return -1;
+            }
             /*
              * Feature selection: fold each effective feature's flags into
              * both profiles (the sub-build picks by the consumer's
@@ -2067,6 +2288,62 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
             forge_util_set_error(context->error, sizeof(context->error),
                       "more than %u dependencies", FORGE_DEPS_MAX_NODES);
             return -1;
+        }
+        /*
+         * Two different names resolving to one foreign checkout with
+         * different build args would rebuild it under each other (last
+         * build wins, first consumer links stale objects). Same-name
+         * diamonds are refused in dep_identity_conflicts above; here
+         * refuse cross-name ones when either side tunes the build.
+         * Native checkouts ignore build args, so they are exempt.
+         */
+        if (!is_native) {
+            size_t ni;
+
+            for (ni = 0U; ni < context->graph->count; ++ni) {
+                const ForgeDepNode *other = &context->graph->nodes[ni];
+                size_t bi;
+                int args_differ = 0;
+
+                if (strcmp(other->root, root) != 0) {
+                    continue;
+                }
+                if (other->cmake_arg_count != dependency->cmake_arg_count ||
+                    other->make_arg_count != dependency->make_arg_count ||
+                    strcmp(other->cmake_toolchain,
+                           dependency->cmake_toolchain) != 0 ||
+                    strcmp(other->make_target,
+                           dependency->make_target) != 0) {
+                    args_differ = 1;
+                } else {
+                    for (bi = 0U; bi < other->cmake_arg_count; ++bi) {
+                        if (strcmp(other->cmake_args[bi],
+                                   dependency->cmake_args[bi]) != 0) {
+                            args_differ = 1;
+                            break;
+                        }
+                    }
+                    for (bi = 0U; !args_differ &&
+                         bi < other->make_arg_count; ++bi) {
+                        if (strcmp(other->make_args[bi],
+                                   dependency->make_args[bi]) != 0) {
+                            args_differ = 1;
+                            break;
+                        }
+                    }
+                }
+                if (args_differ) {
+                    free(parsed);
+                    free(defs);
+                    forge_util_set_error(context->error,
+                              sizeof(context->error),
+                              "dependencies '%s' and '%s' resolve to the "
+                              "same checkout '%s' with different build "
+                              "arguments; give them one spelling",
+                              other->name, dependency->name, root);
+                    return -1;
+                }
+            }
         }
         node = &context->graph->nodes[context->graph->count++];
         (void)snprintf(node->name, sizeof(node->name), "%s", dependency->name);
@@ -2109,6 +2386,26 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
         node->manifest = parsed;
         node->is_native = is_native;
         node->link_artifact[0] = '\0';
+        /* Foreign-build tuning rides the winning declaration. Native
+         * sub-builds ignore it (logged where the sub-build starts). */
+        node->cmake_arg_count = dependency->cmake_arg_count;
+        for (size_t bi = 0U;
+             bi < dependency->cmake_arg_count &&
+             bi < FORGE_BUILD_ARGS_MAX; ++bi) {
+            (void)snprintf(node->cmake_args[bi], sizeof(node->cmake_args[bi]),
+                           "%s", dependency->cmake_args[bi]);
+        }
+        (void)snprintf(node->cmake_toolchain, sizeof(node->cmake_toolchain),
+                       "%s", dependency->cmake_toolchain);
+        node->make_arg_count = dependency->make_arg_count;
+        for (size_t bi = 0U;
+             bi < dependency->make_arg_count &&
+             bi < FORGE_BUILD_ARGS_MAX; ++bi) {
+            (void)snprintf(node->make_args[bi], sizeof(node->make_args[bi]),
+                           "%s", dependency->make_args[bi]);
+        }
+        (void)snprintf(node->make_target, sizeof(node->make_target), "%s",
+                       dependency->make_target);
         deps_log(context->logger, "deps", "using %s (%s)", dependency->name, root);
     }
     return 0;
@@ -2163,6 +2460,14 @@ int forge_deps_resolve(const char *project_root, const ForgeManifest *manifest,
         (void)snprintf(context.force_update_name,
                        sizeof(context.force_update_name), "%s", force_update_name);
     }
+    if (manifest->override_count > FORGE_MANIFEST_MAX_OVERRIDES) {
+        forge_util_set_error(error, error_size, "too many overrides");
+        return -1;
+    }
+    for (size_t oi = 0U; oi < manifest->override_count; ++oi) {
+        context.overrides[oi] = manifest->overrides[oi];
+    }
+    context.override_count = manifest->override_count;
     context.graph = graph;
     context.logger = logger;
     if (forge_paths_join(context.lock_path, sizeof(context.lock_path), project_root,
@@ -2576,6 +2881,337 @@ static int build_scripts_allowed(ForgeLogger *logger, const char *dependency_nam
     return 0;
 }
 
+/*
+ * Foreign-build argument tracking: Make has no configure step, so changed
+ * flags would otherwise rebuild nothing (stale .o files look current).
+ * A `.forge-foreign-args` marker beside the checkout records the canonical
+ * args identity; on mismatch the stale objects are removed so the next
+ * `make` recompiles with the new flags, and CMake simply reconfigures
+ * (its own cache notices the new -D flags). A missing marker with empty
+ * args adopts silently (legacy checkouts rebuild nothing once); a missing
+ * marker with args cleans before the first tuned build.
+ */
+static int foreign_args_identity(const ForgeDepNode *node, char *out,
+                                 size_t out_size)
+{
+    size_t pos = 0U;
+    size_t i;
+
+    out[0] = '\0';
+    if (node->cmake_arg_count == 0U && node->cmake_toolchain[0] == '\0' &&
+        node->make_arg_count == 0U && node->make_target[0] == '\0') {
+        return 0;
+    }
+    for (i = 0U; i < node->cmake_arg_count; ++i) {
+        int w = snprintf(out + pos, out_size - pos, "%s%s",
+                         i == 0U ? "cmake:" : ",", node->cmake_args[i]);
+
+        if (w < 0 || (size_t)w >= out_size - pos) {
+            return -1;
+        }
+        pos += (size_t)w;
+    }
+    {
+        int w = snprintf(out + pos, out_size - pos, "%stoolchain=%s;",
+                         node->cmake_arg_count == 0U ? "cmake:" : ";",
+                         node->cmake_toolchain);
+
+        if (w < 0 || (size_t)w >= out_size - pos) {
+            return -1;
+        }
+        pos += (size_t)w;
+    }
+    for (i = 0U; i < node->make_arg_count; ++i) {
+        int w = snprintf(out + pos, out_size - pos, "%smake:%s",
+                         i == 0U ? "" : ",", node->make_args[i]);
+
+        if (w < 0 || (size_t)w >= out_size - pos) {
+            return -1;
+        }
+        pos += (size_t)w;
+    }
+    {
+        int w = snprintf(out + pos, out_size - pos, "%starget=%s",
+                         node->make_arg_count == 0U ? "make:" : ";",
+                         node->make_target);
+
+        if (w < 0 || (size_t)w >= out_size - pos) {
+            return -1;
+        }
+        pos += (size_t)w;
+    }
+    return 0;
+}
+
+static int has_object_suffix(const char *name)
+{
+    return forge_util_has_suffix(name, ".o") ||
+           forge_util_has_suffix(name, ".obj");
+}
+
+/* Windows virus scanners and indexers briefly lock fresh objects; a single
+ * remove() then fails with EACCES and make would silently reuse the stale
+ * file. Retry for about a second, then verify the file is really gone —
+ * a stale foreign object must fail loudly, never pass as a successful
+ * args change. */
+static int remove_stale_object(const char *path)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 20; ++attempt) {
+        struct stat details;
+
+        if (remove(path) == 0) {
+            return 0;
+        }
+        /* Already gone (raced with a parallel clean) counts as success. */
+        if (stat(path, &details) != 0) {
+            return 0;
+        }
+        deps_sleep_ms(50);
+    }
+    {
+        struct stat details;
+
+        if (stat(path, &details) != 0) {
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Deletes stale `*.o`/`*.obj` under `dir` (same bounds and pruning as the
+ * artifact search; symlinks never followed). Returns 0 on success. */
+static int clean_dir_objects(const char *dir, unsigned *budget, unsigned depth)
+{
+#if FORGE_PLATFORM_WINDOWS
+    WIN32_FIND_DATAA entry;
+    HANDLE handle;
+    char pattern[FORGE_PATH_MAX];
+#else
+    DIR *stream;
+    struct dirent *item;
+#endif
+
+    if (*budget == 0U) {
+        return 0;
+    }
+    if (depth >= FORGE_SCAN_MAX_DEPTH) {
+        return -1;
+    }
+    --*budget;
+#if FORGE_PLATFORM_WINDOWS
+    if (forge_paths_join(pattern, sizeof(pattern), dir, "*") != 0) {
+        return -1;
+    }
+    handle = FindFirstFileA(pattern, &entry);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    do {
+        char child[FORGE_PATH_MAX];
+
+        if (strcmp(entry.cFileName, ".") == 0 || strcmp(entry.cFileName, "..") == 0) {
+            continue;
+        }
+        if (forge_paths_join(child, sizeof(child), dir, entry.cFileName) != 0) {
+            (void)FindClose(handle);
+            return -1;
+        }
+        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) {
+            continue;
+        }
+        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0U) {
+            int status;
+
+            if (strcmp(entry.cFileName, "CMakeFiles") == 0 ||
+                strcmp(entry.cFileName, ".git") == 0 ||
+                strcmp(entry.cFileName, "target") == 0 ||
+                strcmp(entry.cFileName, "build") == 0) {
+                continue;
+            }
+            status = clean_dir_objects(child, budget, depth + 1U);
+            if (status != 0) {
+                (void)FindClose(handle);
+                return status;
+            }
+        } else if (has_object_suffix(entry.cFileName)) {
+            if (remove_stale_object(child) != 0) {
+                (void)FindClose(handle);
+                return -1;
+            }
+        }
+    } while (FindNextFileA(handle, &entry) != 0);
+    if (GetLastError() != ERROR_NO_MORE_FILES) {
+        (void)FindClose(handle);
+        return -1;
+    }
+    (void)FindClose(handle);
+    return 0;
+#else
+    stream = opendir(dir);
+    if (stream == NULL) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    while ((item = readdir(stream)) != NULL) {
+        char child[FORGE_PATH_MAX];
+        struct stat details;
+        int status;
+
+        if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0) {
+            continue;
+        }
+        if (forge_paths_join(child, sizeof(child), dir, item->d_name) != 0) {
+            (void)closedir(stream);
+            return -1;
+        }
+        if (lstat(child, &details) != 0) {
+            continue;
+        }
+        if (S_ISLNK(details.st_mode)) {
+            continue;
+        }
+        if (S_ISDIR(details.st_mode)) {
+            if (strcmp(item->d_name, "CMakeFiles") == 0 ||
+                strcmp(item->d_name, ".git") == 0 ||
+                strcmp(item->d_name, "target") == 0 ||
+                strcmp(item->d_name, "build") == 0) {
+                continue;
+            }
+            status = clean_dir_objects(child, budget, depth + 1U);
+            if (status != 0) {
+                (void)closedir(stream);
+                return status;
+            }
+        } else if (has_object_suffix(item->d_name)) {
+            if (remove_stale_object(child) != 0) {
+                (void)closedir(stream);
+                return -1;
+            }
+        }
+    }
+    (void)closedir(stream);
+    return 0;
+#endif
+}
+
+static int foreign_args_marker_sync(const ForgeDepNode *node,
+                                    ForgeLogger *logger, int *cleaned,
+                                    char *error, size_t error_size)
+{
+    char identity[FORGE_COMMAND_MAX];
+    char marker_path[FORGE_PATH_MAX];
+    char recorded[FORGE_COMMAND_MAX];
+    FILE *file;
+    size_t total = 0U;
+    size_t read_bytes;
+
+    if (cleaned != NULL) {
+        *cleaned = 0;
+    }
+    if (foreign_args_identity(node, identity, sizeof(identity)) != 0) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s': build arguments are too long",
+                  node->name);
+        return -1;
+    }
+    if (forge_paths_join(marker_path, sizeof(marker_path), node->root,
+                         ".forge-foreign-args") != 0) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s': build marker path is too long",
+                  node->name);
+        return -1;
+    }
+    file = fopen(marker_path, "rb");
+    if (file == NULL) {
+        /* No marker: legacy checkout. Empty args adopt silently; tuned
+         * args clean once so the first tuned build cannot reuse stale
+         * objects from an untracked configuration. */
+        if (identity[0] == '\0') {
+            goto write_marker;
+        }
+        deps_log(logger, "deps",
+                 "build arguments changed for '%s'; forcing a clean "
+                 "foreign rebuild", node->name);
+        goto clean;
+    }
+    do {
+        read_bytes = fread(recorded + total, 1U,
+                           sizeof(recorded) - 1U - total, file);
+        total += read_bytes;
+    } while (read_bytes > 0U && total < sizeof(recorded) - 1U);
+    if (ferror(file)) {
+        (void)fclose(file);
+        forge_util_set_error(error, error_size,
+                  "dependency '%s': cannot read build marker", node->name);
+        return -1;
+    }
+    (void)fclose(file);
+    if (total >= sizeof(recorded) - 1U) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s': build marker is too large", node->name);
+        return -1;
+    }
+    recorded[total] = '\0';
+    recorded[strcspn(recorded, "\r\n")] = '\0';
+    if (strcmp(recorded, identity) == 0) {
+        return 0;
+    }
+    deps_log(logger, "deps",
+             "build arguments changed for '%s'; forcing a clean "
+             "foreign rebuild", node->name);
+clean:
+    {
+        unsigned budget = FORGE_SCAN_ENTRY_LIMIT;
+
+        if (clean_dir_objects(node->root, &budget, 0U) != 0) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': cannot clean stale objects "
+                      "after a build-argument change", node->name);
+            return -1;
+        }
+        /*
+         * GNU Make on Windows compares timestamps too coarsely to notice
+         * a same-window relink (recompiled objects, stale archive, exit
+         * 0). Removing the previously found artifact as well forces the
+         * relink unconditionally: a missing target has no mtime to
+         * compare. A Makefile with no rebuild rule then fails loudly
+         * instead of linking stale bytes.
+         */
+        {
+            char previous[FORGE_PATH_MAX];
+            char search_error[FORGE_COMMAND_MAX];
+
+            if (find_static_artifact(node->root, previous, sizeof(previous),
+                                     search_error,
+                                     sizeof(search_error)) == 0 &&
+                remove_stale_object(previous) != 0) {
+                forge_util_set_error(error, error_size,
+                          "dependency '%s': cannot remove the stale "
+                          "library after a build-argument change",
+                          node->name);
+                return -1;
+            }
+        }
+        if (cleaned != NULL) {
+            *cleaned = 1;
+        }
+    }
+write_marker:
+    file = fopen(marker_path, "wb");
+    if (file == NULL || fputs(identity, file) < 0 ||
+        fputc('\n', file) == EOF || fclose(file) != 0) {
+        if (file != NULL) {
+            (void)fclose(file);
+        }
+        forge_util_set_error(error, error_size,
+                  "dependency '%s': cannot record build arguments",
+                  node->name);
+        return -1;
+    }
+    return 0;
+}
+
 int forge_deps_build_foreign(const ForgeDepNode *node, const ForgeCompiler *compiler,
                              int release, int max_jobs, ForgeLogger *logger,
                              char *artifact, size_t artifact_size,
@@ -2600,12 +3236,16 @@ int forge_deps_build_foreign(const ForgeDepNode *node, const ForgeCompiler *comp
                               error_size) != 0) {
         return -1;
     }
+    if (foreign_args_marker_sync(node, logger, NULL, error, error_size) != 0) {
+        return -1;
+    }
     (void)snprintf(jobs, sizeof(jobs), "%d",
                    max_jobs > 0 ? max_jobs : forge_thread_processor_count());
     deps_log(logger, "deps", "building foreign dependency '%s' in %s",
              node->name, node->root);
     if (dir_has_file(node->root, "CMakeLists.txt")) {
         ForgeArgv argv = {0};
+        size_t ai;
 
         if (!forge_util_program_available("cmake")) {
             forge_util_set_error(error, error_size,
@@ -2618,8 +3258,55 @@ int forge_deps_build_foreign(const ForgeDepNode *node, const ForgeCompiler *comp
             forge_argv_append(&argv, node->root) != 0 ||
             forge_argv_append(&argv, "-B") != 0 ||
             forge_argv_appendf(&argv, "%s/build", node->root) != 0 ||
-            forge_argv_appendf(&argv, "-DCMAKE_BUILD_TYPE=%s", build_type) != 0 ||
-            run_tool(logger, "deps", &argv, capture_path, 1, &exit_code,
+            forge_argv_appendf(&argv, "-DCMAKE_BUILD_TYPE=%s", build_type) != 0) {
+            forge_util_set_error(error, error_size,
+                      "out of memory while building a cmake command");
+            forge_argv_free(&argv);
+            return -1;
+        }
+        /* Toolchain first so explicit -D flags below can still win. */
+        if (node->cmake_toolchain[0] != '\0') {
+            char resolved[FORGE_PATH_MAX];
+            char canonical_root[FORGE_PATH_MAX];
+            char canonical_file[FORGE_PATH_MAX];
+
+            if (forge_paths_resolve(node->root, node->cmake_toolchain,
+                                    resolved, sizeof(resolved)) != 0) {
+                forge_util_set_error(error, error_size,
+                          "dependency '%s': cmake-toolchain '%s' does not "
+                          "resolve", node->name, node->cmake_toolchain);
+                forge_argv_free(&argv);
+                return -1;
+            }
+            if (forge_paths_absolute(node->root, canonical_root,
+                                     sizeof(canonical_root)) != 0 ||
+                forge_paths_absolute(resolved, canonical_file,
+                                     sizeof(canonical_file)) != 0 ||
+                !canonical_path_is_within(canonical_file, canonical_root)) {
+                forge_util_set_error(error, error_size,
+                          "dependency '%s': cmake-toolchain '%s' escapes "
+                          "the checkout", node->name,
+                          node->cmake_toolchain);
+                forge_argv_free(&argv);
+                return -1;
+            }
+            if (forge_argv_appendf(&argv, "-DCMAKE_TOOLCHAIN_FILE=%s",
+                                   resolved) != 0) {
+                forge_util_set_error(error, error_size,
+                          "out of memory while building a cmake command");
+                forge_argv_free(&argv);
+                return -1;
+            }
+        }
+        for (ai = 0U; ai < node->cmake_arg_count; ++ai) {
+            if (forge_argv_append(&argv, node->cmake_args[ai]) != 0) {
+                forge_util_set_error(error, error_size,
+                          "out of memory while building a cmake command");
+                forge_argv_free(&argv);
+                return -1;
+            }
+        }
+        if (run_tool(logger, "deps", &argv, capture_path, 1, &exit_code,
                      error, error_size) != 0 ||
             exit_code != 0) {
             forge_util_set_error(error, error_size,
@@ -2667,6 +3354,21 @@ int forge_deps_build_foreign(const ForgeDepNode *node, const ForgeCompiler *comp
         }
         if (compiler != NULL && compiler->kind != FORGE_COMPILER_MSVC &&
             forge_argv_appendf(&argv, "CC=%s", compiler->program) != 0) {
+            forge_util_set_error(error, error_size,
+                      "out of memory while building a make command");
+            forge_argv_free(&argv);
+            return -1;
+        }
+        for (size_t ai = 0U; ai < node->make_arg_count; ++ai) {
+            if (forge_argv_append(&argv, node->make_args[ai]) != 0) {
+                forge_util_set_error(error, error_size,
+                          "out of memory while building a make command");
+                forge_argv_free(&argv);
+                return -1;
+            }
+        }
+        if (node->make_target[0] != '\0' &&
+            forge_argv_append(&argv, node->make_target) != 0) {
             forge_util_set_error(error, error_size,
                       "out of memory while building a make command");
             forge_argv_free(&argv);

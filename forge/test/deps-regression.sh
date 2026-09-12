@@ -396,5 +396,70 @@ grep -q "libk = .*commit = \"$base_k\"" Forge.lock \
     || fail "K7: named path-dependency update must work offline"
 pass "K7: named path-dependency updates touch nothing else, even offline"
 
+# ----------------------------------------------------------------------
+# K8: foreign Make deps honor make-args/make-target (needs make+ar)
+# ----------------------------------------------------------------------
+if command -v make >/dev/null 2>&1 && command -v ar >/dev/null 2>&1; then
+    export FORGE_ALLOW_DEP_BUILD_SCRIPTS=1
+    dep="$work/dep-make"
+    mkdir -p "$dep"
+    cat >"$dep/calc.h" <<'EOF'
+#ifndef CALC_H
+#define CALC_H
+int calc_value(void);
+#endif
+EOF
+    cat >"$dep/calc.c" <<'EOF'
+#include "calc.h"
+#ifndef MULT
+#define MULT 1
+#endif
+int calc_value(void) { return 3 * MULT; }
+EOF
+    printf 'libcalc.a: calc.o\n\tar rcs libcalc.a calc.o\ncalc.o: calc.c calc.h\n\t$(CC) -c calc.c -o calc.o $(EXTRA_CFLAGS)\n' >"$dep/Makefile"
+    # K8a: defaults build (MULT=1 -> 3).
+    proj="$work/proj-k8a"
+    mkdir -p "$proj/src"
+    write_project_manifest "$proj/Forge.toml" "k8a" \
+        "calc = { path = \"$work_forge/dep-make\" }"
+    printf '#include <stdio.h>\n#include "calc.h"\nint main(void) { return calc_value(); }\n' >"$proj/src/main.c"
+    (cd "$proj" && "$FORGE" run >/dev/null 2>&1); code=$?
+    [ "$code" -eq 3 ] || fail "K8a: default foreign build exit $code, want 3"
+    pass "K8: default foreign Make build works"
+    # K8b: make-args inject EXTRA_CFLAGS (MULT=7 -> 21).
+    proj="$work/proj-k8b"
+    mkdir -p "$proj/src"
+    write_project_manifest "$proj/Forge.toml" "k8b" \
+        "calc = { path = \"$work_forge/dep-make\", make-args = \"EXTRA_CFLAGS=-DMULT=7\" }"
+    printf '#include <stdio.h>\n#include "calc.h"\nint main(void) { return calc_value(); }\n' >"$proj/src/main.c"
+    (cd "$proj" && "$FORGE" run >/dev/null 2>&1); code=$?
+    [ "$code" -eq 21 ] || fail "K8b: make-args build exit $code, want 21"
+    pass "K8: make-args reach the foreign build"
+    # K8c: explicit make-target names the same goal.
+    proj="$work/proj-k8c"
+    mkdir -p "$proj/src"
+    write_project_manifest "$proj/Forge.toml" "k8c" \
+        "calc = { path = \"$work_forge/dep-make\", make-target = \"libcalc.a\" }"
+    printf '#include <stdio.h>\n#include "calc.h"\nint main(void) { return calc_value(); }\n' >"$proj/src/main.c"
+    (cd "$proj" && "$FORGE" run >/dev/null 2>&1); code=$?
+    [ "$code" -eq 3 ] || fail "K8c: make-target build exit $code, want 3"
+    pass "K8: make-target selects the foreign goal"
+    # K8d: same checkout with different args is a divergent diamond.
+    proj="$work/proj-k8d"
+    mkdir -p "$proj/src"
+    write_project_manifest "$proj/Forge.toml" "k8d" \
+        "cala = { path = \"$work_forge/dep-make\" }" \
+        "calb = { path = \"$work_forge/dep-make\", make-args = \"EXTRA_CFLAGS=-DMULT=7\" }"
+    echo 'int main(void) { return 0; }' >"$proj/src/main.c"
+    if (cd "$proj" && "$FORGE" check >/dev/null 2>&1); then
+        fail "K8d: divergent build args should conflict"
+    fi
+    (cd "$proj" && "$FORGE" check 2>&1 | grep -qi "differ\|conflict") \
+        || fail "K8d: build-args conflict is unclear"
+    pass "K8: divergent build args conflict loudly"
+else
+    echo "skip: K8 (no make/ar for foreign-build tests)"
+fi
+
 echo "all dependency regressions passed"
 rm -rf "$work"

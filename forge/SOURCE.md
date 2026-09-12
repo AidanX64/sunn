@@ -7,7 +7,7 @@ edit upstream and re-sync.
 - Upstream repo: `https://github.com/AidanX64/forge.git` (branch `master`)
 - Local checkout: `C:\Users\dooms\source\forge`
 - Upstream HEAD: `32ce436416275520176da2abb1392749dc94c899`
-- Upstream status at copy time: clean
+- Upstream status at copy time: dirty (uncommitted feature work, see below)
 - Copied: 2026-09-11 (robocopy, working tree)
 - Excluded from copy: `.git/`, `.github/`, `build/`, `target/`, `test/target/`, `*.exe`, `*.o`, `*.obj`, `*.a`, `*.lib`, `.scratch/`, `.opencode/`, `examples/`
 - CI ownership: upstream keeps its own `.github/`; `sunn/.github/workflows/ci.yml`
@@ -16,7 +16,21 @@ edit upstream and re-sync.
 Upstream `git status --short` at copy time:
 
 ```text
-(clean)
+ M AGENTS.md
+ M README.md
+ M include/forge/deps.h
+ M include/forge/manifest.h
+ M include/forge/orchestrator.h
+ M include/forge/pkg.h
+ M include/forge/registry.h
+ M src/cli.c
+ M src/commands.c
+ M src/deps.c
+ M src/manifest.c
+ M src/pkg.c
+ M src/registry.c
+ M test/deps-regression.sh
+ M test/registry-regression.sh
 ```
 
 Note: this snapshot includes the committed sunn-registry client
@@ -25,6 +39,15 @@ Forge.lock pins, `forge add --registry/--version`,
 `test/registry-regression.sh`, Makefile header tracking). The untracked
 `test/regression.sh` also carries an updated R1 assertion for the new
 source-count message.
+
+This snapshot additionally carries uncommitted upstream work (to be
+committed upstream as its own change): full version-range requirements
+(`version-range` with `= >= > <= < ^ ~` wildcards, `,` AND, `||` OR,
+plus `max-version` and top-level `[overrides]`), `FORGE_OVERLAYS`
+local-port shadowing, per-dependency foreign-build args
+(`cmake-args`/`cmake-toolchain`/`make-args`/`make-target` with
+args-change rebuild tracking), a `git+` registry-base hint, and new
+regression coverage R16–R21 plus K8 (upstream `make regression` green).
 
 ## Sync
 

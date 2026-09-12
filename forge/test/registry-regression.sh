@@ -192,7 +192,9 @@ refresh_index() {
     # Rebuilds packages/sunn.registry.json from whatever package dirs exist
     # (same layout as the real static hosting: index inside packages/).
     # The newest release per package comes from a .latest sidecar (written
-    # at pack time) so no version-sort tool is needed portably.
+    # at pack time) so no version-sort tool is needed portably. Every
+    # <version>.json on disk is listed in versions[] so range resolution
+    # can pick the newest satisfying release client-side.
     mkdir -p "$work/stub/packages"
     {
         echo '{'
@@ -207,8 +209,26 @@ refresh_index() {
             latest="$(cat "$dir/.latest")"
             [ "$first" -eq 1 ] || echo ','
             first=0
-            printf '    {"name": "%s", "latest": "%s", "description": "stub", "license": "MIT", "homepage": "", "index": "/packages/%s/%s.json"}' \
+            printf '    {"name": "%s", "latest": "%s", "latest_revision": 0, "description": "stub", "license": "MIT", "homepage": "", "index": "/packages/%s/%s.json", "versions": [' \
                 "$name" "$latest" "$name" "$latest"
+            local vfirst=1 vf
+            for vf in "$dir"/*.json; do
+                [ -f "$vf" ] || continue
+                local base
+                base="$(basename "$vf" .json)"
+                case "$base" in
+                    Forge|*.toml) continue ;;
+                esac
+                # Only MAJOR.MINOR.PATCH file names are releases.
+                case "$base" in
+                    *.*.*) ;;
+                    *) continue ;;
+                esac
+                [ "$vfirst" -eq 1 ] || printf ', '
+                vfirst=0
+                printf '{"version": "%s", "revision": 0}' "$base"
+            done
+            printf ']}'
         done
         echo ''
         echo '  ]'
@@ -638,6 +658,182 @@ int main(void) { return featlib2_value(); }'
 [ "$code" -eq 5 ] || fail "R15: feature leaked into a plain build? exit $code, want 5"
 grep -q "featdep = " "$work/c15b/Forge.lock" && fail "R15: plain lock should not list the feature dep"
 pass "R15 feature dependencies"
+
+# --- R16: version ranges ------------------------------------------------
+# A range picks the newest satisfying release; caret/tilde/wildcard/OR all
+# resolve client-side from the index versions[] list.
+make_registry_pkg rangelib 0.1.0 1 >/dev/null
+make_registry_pkg rangelib 0.2.0 2 >/dev/null
+make_registry_pkg rangelib 1.0.0 10 >/dev/null
+write_baseline
+make_consumer "$work/c16" 'int main(void) { return 0; }'
+if ! (cd "$work/c16" && "$FORGE" add r --registry rangelib --version-range ">=0.1.0, <1.0.0" >"$work/c16.log" 2>&1); then
+    cat "$work/c16.log"
+    fail "R16: range add failed"
+fi
+grep -q 'version = "0.2.0"' "$work/c16/Forge.lock" \
+    || fail "R16: range >=0.1.0,<1.0.0 should pin 0.2.0"
+make_consumer "$work/c16b" 'int main(void) { return 0; }'
+(cd "$work/c16b" && "$FORGE" add r --registry rangelib --version-range "^0.2.0" >/dev/null 2>&1) \
+    || fail "R16: caret add failed"
+grep -q 'version = "0.2.0"' "$work/c16b/Forge.lock" \
+    || fail "R16: ^0.2.0 should pin 0.2.0, not 1.0.0"
+make_consumer "$work/c16c" 'int main(void) { return 0; }'
+(cd "$work/c16c" && "$FORGE" add r --registry rangelib --version-range "0.1.x" >/dev/null 2>&1) \
+    || fail "R16: wildcard add failed"
+grep -q 'version = "0.1.0"' "$work/c16c/Forge.lock" \
+    || fail "R16: 0.1.x should pin 0.1.0"
+make_consumer "$work/c16d" 'int main(void) { return 0; }'
+if (cd "$work/c16d" && "$FORGE" add r --registry rangelib --version-range ">=9.9.9" >/dev/null 2>&1); then
+    fail "R16: unsatisfiable range should fail add"
+fi
+grep -q "r = " "$work/c16d/Forge.toml" && fail "R16: failed range add left a manifest entry"
+pass "R16 version ranges"
+# --- R17: max-version caps ------------------------------------------------
+make_consumer "$work/c17" 'int main(void) { return 0; }'
+(cd "$work/c17" && "$FORGE" add r --registry rangelib --max-version 0.2.0 >/dev/null 2>&1) \
+    || fail "R17: max-version add failed"
+grep -q 'version = "0.2.0"' "$work/c17/Forge.lock" \
+    || fail "R17: bare + max 0.2.0 should pin 0.2.0, not 1.0.0"
+make_consumer "$work/c17b" 'int main(void) { return 0; }'
+(cd "$work/c17b" && "$FORGE" add r --registry rangelib --version-range ">=0.1.0" --max-version 0.1.0 >/dev/null 2>&1) \
+    || fail "R17: range+max add failed"
+grep -q 'version = "0.1.0"' "$work/c17b/Forge.lock" \
+    || fail "R17: range+max should pin 0.1.0"
+make_consumer "$work/c17c" 'int main(void) { return 0; }'
+if (cd "$work/c17c" && "$FORGE" add r --registry rangelib --version 1.0.0 --max-version 0.2.0 >/dev/null 2>&1); then
+    fail "R17: exact + max-version should fail validation"
+fi
+pass "R17 max-version caps"
+
+# --- R18: overrides force one version -------------------------------------
+make_consumer "$work/c18" 'int main(void) { return 0; }'
+printf '\n[dependencies]\nr = { registry = "rangelib" }\n\n[overrides]\nrangelib = "0.1.0"\n' >>"$work/c18/Forge.toml"
+(cd "$work/c18" && "$FORGE" build >/dev/null 2>&1) \
+    || fail "R18: override build failed"
+grep -q 'version = "0.1.0"' "$work/c18/Forge.lock" \
+    || fail "R18: override should force 0.1.0 over newest 1.0.0"
+make_consumer "$work/c18b" 'int main(void) { return 0; }'
+printf '\n[dependencies]\nr = { registry = "rangelib", version = "1.0.0" }\n\n[overrides]\nrangelib = "0.1.0"\n' >>"$work/c18b/Forge.toml"
+if (cd "$work/c18b" && "$FORGE" build >/dev/null 2>&1); then
+    fail "R18: override conflicting with an exact pin should fail"
+fi
+pass "R18 overrides"
+
+# --- R19: manifest validation for new keys --------------------------------
+make_consumer "$work/c19" 'int main(void) { return 0; }'
+if (cd "$work/c19" && "$FORGE" add r --registry rangelib --version 0.1.0 --version-range "^0.1.0" >/dev/null 2>&1); then
+    fail "R19: --version + --version-range should fail"
+fi
+(cd "$work/c19" && "$FORGE" add r --registry rangelib --version 0.1.0 --version-range "^0.1.0" 2>&1 | grep -qi "only one of") \
+    || fail "R19: exclusivity error is unclear"
+if (cd "$work/c19" && "$FORGE" add r --registry rangelib --version-range "bogus!!" >/dev/null 2>&1); then
+    fail "R19: bogus range should fail"
+fi
+grep -q "r = " "$work/c19/Forge.toml" && fail "R19: failed add left a manifest entry"
+pass "R19 range validation + rollback"
+
+# --- R20: overlays shadow the registry ------------------------------------
+mkdir -p "$work/overlay/packages/overlib"
+ovsrc="$work/overlay-src/overlib"
+mkdir -p "$ovsrc/src" "$ovsrc/include"
+cat >"$ovsrc/Forge.toml" <<'EOF'
+[project]
+name = "overlib"
+version = "9.9.9"
+
+[sources]
+c = ["src"]
+cpp = []
+asm = []
+
+[targets]
+os = ["windows", "linux", "macos"]
+arch = ["x86_64", "aarch64"]
+
+[profile.debug]
+cflags = ["-g", "-O0"]
+
+[profile.release]
+cflags = ["-O2"]
+EOF
+cat >"$ovsrc/include/overlib.h" <<'EOF'
+#ifndef overlib_H
+#define overlib_H
+int overlib_value(void);
+#endif
+EOF
+cat >"$ovsrc/src/overlib.c" <<'EOF'
+#include "overlib.h"
+int overlib_value(void) { return 99; }
+EOF
+tar -czf "$work/overlay/packages/overlib/overlib-9.9.9.tar.gz" -C "$ovsrc" Forge.toml include src
+ovsha="$(sha256_of "$work/overlay/packages/overlib/overlib-9.9.9.tar.gz")"
+cat >"$work/overlay/packages/overlib/9.9.9.json" <<EOF
+{
+  "name": "overlib",
+  "version": "9.9.9",
+  "revision": 0,
+  "description": "overlay stub",
+  "license": "MIT",
+  "homepage": "",
+  "lang": "c",
+  "build": "forge",
+  "dependencies": [],
+  "source": {"kind": "url", "location": "/packages/overlib/overlib-9.9.9.tar.gz", "sha256": "$ovsha"},
+  "patches": [],
+  "features": [],
+  "default-features": [],
+  "forge": {"manifest": "/packages/overlib/Forge.toml"}
+}
+EOF
+cp "$ovsrc/Forge.toml" "$work/overlay/packages/overlib/Forge.toml"
+mkdir -p "$work/overlay/packages"
+cat >"$work/overlay/packages/sunn.registry.json" <<'EOF'
+{
+  "name": "overlay-test",
+  "description": "overlay stub index",
+  "packages": [
+    {"name": "overlib", "latest": "9.9.9", "latest_revision": 0, "description": "stub", "license": "MIT", "homepage": "", "index": "/packages/overlib/9.9.9.json", "versions": [{"version": "9.9.9", "revision": 0}]}
+  ]
+}
+EOF
+make_consumer "$work/c20" '#include <stdio.h>
+#include "overlib.h"
+int main(void) { return overlib_value(); }'
+# NOTE: overlay tarball locations resolve against the overlay root via a
+# file:// view, so the .tar.gz above must exist under the overlay dir
+# (it does: packages/overlib/overlib-9.9.9.tar.gz).
+(cd "$work/c20" && FORGE_OVERLAYS="$work_forge/overlay" "$FORGE" add o --registry overlib --version 9.9.9 >/dev/null 2>&1) \
+    || fail "R20: overlay add failed"
+(cd "$work/c20" && FORGE_OVERLAYS="$work_forge/overlay" "$FORGE" run >/dev/null 2>&1); code=$?
+[ "$code" -eq 99 ] || fail "R20: overlay build exit $code, want 99"
+if FORGE_OVERLAYS="$work_forge/overlay/../nope" "$FORGE" --help >/dev/null 2>&1; then
+    :
+fi
+pass "R20 overlays"
+
+# --- R21: foreign-build args validation -----------------------------------
+# cmake-args/make-args reject shell metacharacters at parse time; unknown
+# build keys fail loudly. No build tools needed — resolution never starts.
+make_consumer "$work/c21" 'int main(void) { return 0; }'
+printf '\n[dependencies]\nbad = { registry = "rangelib", version = "0.1.0", cmake-args = "A;B" }\n' >>"$work/c21/Forge.toml"
+if (cd "$work/c21" && "$FORGE" build >/dev/null 2>&1); then
+    fail "R21: cmake-args with ';' should fail"
+fi
+(cd "$work/c21" && "$FORGE" build 2>&1 | grep -qi "metacharacters") \
+    || fail "R21: metacharacter error is unclear"
+make_consumer "$work/c21b" 'int main(void) { return 0; }'
+printf '\n[dependencies]\nbad = { registry = "rangelib", version = "0.1.0", make-target = "a/b" }\n' >>"$work/c21b/Forge.toml"
+if (cd "$work/c21b" && "$FORGE" build >/dev/null 2>&1); then
+    fail "R21: make-target with '/' should fail"
+fi
+make_consumer "$work/c21c" 'int main(void) { return 0; }'
+printf '\n[dependencies]\nbad = { registry = "rangelib", version = "0.1.0", cmake-toolchain = "../evil.cmake" }\n' >>"$work/c21c/Forge.toml"
+if (cd "$work/c21c" && "$FORGE" build >/dev/null 2>&1); then
+    fail "R21: cmake-toolchain with '..' should fail"
+fi
+pass "R21 foreign-build args validation"
 
 # --- R9: http loopback (needs python3) ----------------------------------
 if command -v python3 >/dev/null 2>&1; then
