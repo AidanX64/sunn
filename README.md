@@ -102,9 +102,9 @@ registry/             shadcn distributables + registry.json
 public/packages/      native registry hosting + fixture tarballs
 public/r/             built shadcn output (from `shadcn build`)
 registry-fixtures/    hello-c/cpp/asm library sources packed by script
-forge/                vendored forge repo (see forge/SOURCE.md)
+forge/                canonical Forge source (see forge/SOURCE.md)
 vendors/              future companions (openshaders, tweakcn, shadcn-ui)
-scripts/              vendor sync + fixture packaging
+scripts/              mirror + fixture packaging
 ```
 
 ## Native registry
@@ -143,14 +143,14 @@ Pins land in `Forge.lock` as `{ version, sha256, url }`; every download
 is checksum-verified before unpacking. `file://` registry URLs work for
 local mirrors and tests with `FORGE_ALLOW_UNSAFE_REGISTRY=1`.
 
-## Native Forge (vendored)
+## Native Forge (canonical)
 
-`forge/` is a clean copy of the standalone native Forge repo
-(`https://github.com/AidanX64/forge.git`, branch `master`); upstream stays
-the source of truth, so edit there and re-sync — never the reverse:
+`sunn/forge` is the canonical native Forge source tree. The standalone
+Forge checkout/repository is a downstream mirror; make changes here, verify
+them here, then mirror the exact Sunn commit outward — never the reverse:
 
 ```sh
-bun run sync:forge           # re-copy upstream (keeps forge/SOURCE.md)
+bun run mirror:forge         # preview/check the standalone mirror
 make -C forge clean && make -C forge CC=gcc
 ```
 

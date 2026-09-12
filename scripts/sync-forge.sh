@@ -1,27 +1,6 @@
 #!/bin/sh
-# One-way vendor sync: /c/Users/dooms/source/forge -> sunn/forge
-# Preserves sunn/forge/SOURCE.md. Excludes build outputs, .git, and .github
-# (CI is owned per-repo: upstream keeps its own, sunn tests the vendored
-# tree via sunn/.github/workflows/ci.yml).
+# RETIRED: upstream-first sync is frozen.
+# sunn/forge is canonical. Use scripts/mirror-forge.sh instead.
 set -eu
-UPSTREAM="${FORGE_UPSTREAM:-C:/Users/dooms/source/forge}"
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="$ROOT/forge"
-BACKUP="$(mktemp)"
-trap 'rm -f "$BACKUP"' EXIT
-if [ -f "$DEST/SOURCE.md" ]; then cp "$DEST/SOURCE.md" "$BACKUP"; fi
-if command -v rsync >/dev/null 2>&1; then
-  rsync -a --delete \
-    --exclude='.git/' --exclude='.github/' --exclude='build/' --exclude='target/' \
-    --exclude='*.exe' --exclude='*.o' --exclude='*.obj' \
-    --exclude='*.a' --exclude='*.lib' \
-    --exclude='.scratch/' --exclude='.opencode/' --exclude='examples/' \
-    "$UPSTREAM/" "$DEST/"
-else
-  echo "rsync not found, falling back to cp (no delete). Install rsync for exact sync." >&2
-  cp -R "$UPSTREAM/." "$DEST/"
-  # cp has no excludes: drop what sync would never vendor.
-  rm -rf "$DEST/.github" "$DEST/.git" "$DEST/build" "$DEST/target"
-fi
-if [ -s "$BACKUP" ]; then cp "$BACKUP" "$DEST/SOURCE.md"; fi
-echo "sync-forge: done. Update forge/SOURCE.md HEAD/date manually."
+echo "sync-forge is retired; sunn/forge is canonical. Use sh scripts/mirror-forge.sh." >&2
+exit 1

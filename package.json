@@ -78,7 +78,9 @@
     "forge:build": "make -C forge CC=gcc",
     "forge:test": "make -C forge test",
     "forge:clean": "make -C forge clean",
-    "sync:forge": "powershell -ExecutionPolicy Bypass -File scripts/sync-forge.ps1",
+    "sync:forge": "powershell -NoProfile -Command \"throw 'sync:forge is retired; sunn/forge is canonical. Use bun run mirror:forge.'\"",
+    "mirror:forge": "powershell -ExecutionPolicy Bypass -File scripts/mirror-forge.ps1 --Check",
+    "mirror:forge:apply": "powershell -ExecutionPolicy Bypass -File scripts/mirror-forge.ps1 --Apply",
     "packages:fixtures": "python scripts/package_registry_fixtures.py"
   },
   "dependencies": {

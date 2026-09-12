@@ -101,7 +101,7 @@ sunn/
 ├── public/packages/        native package registry
 ├── public/r/               built shadcn registry output
 ├── registry-fixtures/      native registry test fixtures
-├── forge/                  vendored native Forge source
+├── forge/                  canonical native Forge source
 ├── vendors/                future registry integrations
 └── scripts/                registry/build/synchronization scripts
 ```
@@ -110,7 +110,7 @@ The Sunn web application is the registry frontend and server.
 
 The Sunn web CLI is a Bun/TypeScript CLI distributed through the Bun/npm ecosystem.
 
-The native Forge implementation remains the standalone C project vendored under `forge/`.
+The native Forge implementation remains the standalone C project maintained canonically under `forge/`.
 
 ## Web registry
 
@@ -196,14 +196,14 @@ Per-triplet binary artifacts are a future phase.
 
 ## Forge source of truth
 
-`forge/` is a vendored copy of the standalone Forge repository
-(`https://github.com/AidanX64/forge.git`, branch `master`).
+`sunn/forge` is the canonical Forge source tree.
 
-The upstream Forge repository is the source of truth.
+The standalone Forge checkout/repository is a downstream mirror. It must not
+receive independent source changes.
 
-Never edit C sources directly inside the vendored `forge/` tree.
-
-Forge changes must be made upstream, verified there, and then synchronized into Sunn using the existing synchronization workflow.
+Make Forge changes under `sunn/forge/`, verify them there, then mirror the
+exact Sunn commit into the standalone Forge checkout using the mirror
+workflow.
 
 See:
 
@@ -324,10 +324,10 @@ bun run forge:test
 bun run forge:clean
 ```
 
-Synchronizing Forge:
+Mirroring Forge to the standalone checkout:
 
 ```sh
-bun run sync:forge
+bun run mirror:forge
 ```
 
 Use Bun for repository development and dependency installation.
