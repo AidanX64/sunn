@@ -40,7 +40,9 @@ trap 'rm -rf "$STAGE"' EXIT
 git -C "$ROOT" archive --format=tar --output="$STAGE/forge.tar" "$sha" "$SUB"
 tar -xf "$STAGE/forge.tar" -C "$STAGE"
 MANIFEST="$STAGE/manifest.txt"
-git -C "$ROOT" ls-tree -r --name-only "$sha" -- "$SUB" | sed 's|^forge/||' | grep -v '^SOURCE.md$' | grep -v '^$' | sort >"$MANIFEST"
+# Byte-order sort to match the ordinal sort in mirror-forge.ps1 (locale
+# sorts order mixed-case names like test/Forge.toml differently).
+git -C "$ROOT" ls-tree -r --name-only "$sha" -- "$SUB" | sed 's|^forge/||' | grep -v '^SOURCE.md$' | grep -v '^$' | LC_ALL=C sort >"$MANIFEST"
 if command -v sha256sum >/dev/null 2>&1; then
   shasum() { sha256sum "$1" | cut -d' ' -f1; }
 else

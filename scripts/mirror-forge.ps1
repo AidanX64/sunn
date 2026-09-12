@@ -116,8 +116,15 @@ try {
     $removed = @($destManaged | Where-Object { -not $sourceSet.Contains($_) })
 
     # Generated standalone provenance (standalone-only; never mirrored back).
+    # Ordinal (byte-order) sort to match `LC_ALL=C sort` in mirror-forge.sh.
+    # NOTE: the array MUST be [string[]]: Windows PowerShell 5.1 silently
+    # ignores a custom comparer passed for Object[], falling back to the
+    # culture sort (which orders mixed-case names like test/Forge.toml
+    # differently and destabilizes the tree hash).
+    [string[]]$sortedFiles = @($sourceFiles)
+    [Array]::Sort($sortedFiles, [System.StringComparer]::Ordinal)
     $hashLines = @()
-    foreach ($rel in ($sourceFiles | Sort-Object)) {
+    foreach ($rel in $sortedFiles) {
         $src = Join-Path (Join-Path $staging $SourceSub) $rel
         $hashLines += "$(Get-NormalizedHash -LiteralPath $src)  $rel"
     }
