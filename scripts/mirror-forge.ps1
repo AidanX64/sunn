@@ -123,7 +123,7 @@ try {
     }
     $rootHash = [System.BitConverter]::ToString(
         [System.Security.Cryptography.SHA256]::Create().ComputeHash(
-            [System.Text.Encoding]::UTF8.GetBytes(($hashLines -join "`n")))).Replace("-", "").ToLower()
+            [System.Text.Encoding]::UTF8.GetBytes((($hashLines -join "`n") + "`n")))).Replace("-", "").ToLower()
     $mirrorMd = @(
         "# forge - downstream mirror",
         "",

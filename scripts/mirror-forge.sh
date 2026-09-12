@@ -85,19 +85,21 @@ HASHLIST="$STAGE/hashlist.txt"
 while IFS= read -r rel; do [ -n "$rel" ] || continue; printf '%s  %s\n' "$(normsha "$STAGE/$SUB/$rel")" "$rel"; done <"$MANIFEST" >"$HASHLIST"
 root_hash="$(shasum "$HASHLIST")"
 mirror_note="$(cat <<EOF
-# forge — downstream mirror
+# forge - downstream mirror
 
-This checkout is a read-only mirror. \`sunn/forge\` is canonical — do not edit sources here.
+This checkout is a read-only mirror. sunn/forge is canonical - do not edit sources here.
 
-- Canonical repo: \`https://github.com/AidanX64/sunn.git\` (\`forge/\` subtree, branch \`$sunn_branch\`)
-- Canonical commit: \`$sha\` ($commit_date)
+- Canonical repo: https://github.com/AidanX64/sunn.git (forge/ subtree, branch $sunn_branch)
+- Canonical commit: $sha ($commit_date)
 - Canonical files: $(wc -l <"$MANIFEST" | tr -d ' ')
-- Canonical tree hash: \`$root_hash\`
+- Canonical tree hash: $root_hash
 - Mirrored: $(date -u +%F) (mirror-forge)
 EOF
 )"
 note_differs=0
-if [ ! -f "$MIRROR/MIRROR.md" ] || [ "$(cat "$MIRROR/MIRROR.md")" != "$mirror_note" ]; then note_differs=1; fi
+# The working tree may carry CRLF (text=auto checkouts); normalize before
+# comparing so identical notes compare equal on every platform.
+if [ ! -f "$MIRROR/MIRROR.md" ] || [ "$(tr -d '\r' <"$MIRROR/MIRROR.md")" != "$mirror_note" ]; then note_differs=1; fi
 echo "canonical: sunn@$sha"
 echo "mirror:    $MIRROR (branch $mirror_branch)"
 echo "missing-in-mirror: $missing; changed: $changed; removed-upstream: $removed; mirror-note-differs: $note_differs"
