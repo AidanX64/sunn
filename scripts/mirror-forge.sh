@@ -55,8 +55,15 @@ if ! command -v sha256sum >/dev/null 2>&1; then
 fi
 missing=0; changed=0; removed=0
 missing_list=""; changed_list=""; removed_list=""
+DESTLIST="$STAGE/dest.txt"
+git -C "$MIRROR" ls-files | sort >"$DESTLIST"
 while IFS= read -r rel; do
   [ -n "$rel" ] || continue
+  # Case-sensitive membership first: the filesystem may be
+  # case-insensitive, hiding case-only renames (Forge.toml vs forge.toml).
+  if ! grep -qxF "$rel" "$DESTLIST"; then
+    missing=$((missing+1)); missing_list="$missing_list $rel"; continue
+  fi
   if [ ! -f "$MIRROR/$rel" ]; then
     missing=$((missing+1)); missing_list="$missing_list $rel"; continue
   fi
@@ -94,7 +101,10 @@ if [ ! -f "$MIRROR/MIRROR.md" ] || [ "$(cat "$MIRROR/MIRROR.md")" != "$mirror_no
 echo "canonical: sunn@$sha"
 echo "mirror:    $MIRROR (branch $mirror_branch)"
 echo "missing-in-mirror: $missing; changed: $changed; removed-upstream: $removed; mirror-note-differs: $note_differs"
-[ "$MODE" = "check" ] && { [ "$missing" -eq 0 ] && [ "$changed" -eq 0 ] && [ "$removed" -eq 0 ] && [ "$note_differs" -eq 0 ]; }
+if [ "$MODE" = "check" ]; then
+  # A stale mirror note alone is informational; only content drift fails.
+  [ "$missing" -eq 0 ] && [ "$changed" -eq 0 ] && [ "$removed" -eq 0 ]
+fi
 for rel in $removed; do rm -f "$MIRROR/$rel"; done
 while IFS= read -r rel; do
   [ -n "$rel" ] || continue

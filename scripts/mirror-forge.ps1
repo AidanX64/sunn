@@ -91,20 +91,29 @@ try {
 
     $destTracked = @(Invoke-Git $MirrorPath @("ls-files") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
     $destManaged = @($destTracked | Where-Object { -not (Test-Preserved $_) })
+    # Case-sensitive destination set (same reason as $sourceSet below):
+    # Test-Path alone follows Windows case-insensitivity and would miss
+    # case-only renames.
+    $destSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($rel in $destTracked) { [void]$destSet.Add($rel) }
 
     $missing = @()
     $changed = @()
     foreach ($rel in $sourceFiles) {
         $src = Join-Path (Join-Path $staging $SourceSub) $rel
         $dst = Join-Path $MirrorPath $rel
+        if (-not $destSet.Contains($rel)) { $missing += $rel; continue }
         if (-not (Test-Path -LiteralPath $dst -PathType Leaf)) { $missing += $rel; continue }
         $a = Get-NormalizedHash -LiteralPath $src
         $b = Get-NormalizedHash -LiteralPath $dst
         if ($a -ne $b) { $changed += $rel }
     }
-    $sourceSet = @{}
-    foreach ($rel in $sourceFiles) { $sourceSet[$rel] = $true }
-    $removed = @($destManaged | Where-Object { -not $sourceSet.ContainsKey($_) })
+    # Case-sensitive set: Windows paths are case-insensitive, but git
+    # tracks case (Forge.toml vs forge.toml), so a plain hashtable
+    # (case-insensitive) would miss case-only renames.
+    $sourceSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($rel in $sourceFiles) { [void]$sourceSet.Add($rel) }
+    $removed = @($destManaged | Where-Object { -not $sourceSet.Contains($_) })
 
     # Generated standalone provenance (standalone-only; never mirrored back).
     $hashLines = @()
@@ -137,6 +146,7 @@ try {
     $noteDrift = 0
     if ($mirrorDiffers) { $noteDrift = 1 }
     $totalDrift = $missing.Count + $changed.Count + $removed.Count + $noteDrift
+    $contentDrift = $missing.Count + $changed.Count + $removed.Count
     Write-Output "canonical: sunn@$sha ($($sourceFiles.Count) files, tree $rootHash)"
     Write-Output "mirror:    $MirrorPath (branch $mirrorBranch)"
     Write-Output "missing-in-mirror: $($missing.Count); changed: $($changed.Count); removed-upstream: $($removed.Count); mirror-note-differs: $mirrorDiffers"
@@ -145,7 +155,10 @@ try {
     foreach ($rel in ($removed | Select-Object -First 20)) { Write-Output "  - $rel" }
 
     if (-not $DoApply) {
-        if ($totalDrift -ne 0) { exit 1 }
+        # A stale mirror note alone is informational (it records which
+        # canonical commit was last mirrored); only content drift fails.
+        if ($contentDrift -ne 0) { exit 1 }
+        if ($totalDrift -ne 0) { Write-Output "mirror-forge: content matches; mirror note is stale."; return }
         Write-Output "mirror-forge: clean."
         return
     }
