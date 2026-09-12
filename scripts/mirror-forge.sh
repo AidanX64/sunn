@@ -46,6 +46,13 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
   shasum() { shasum -a 256 "$1" | cut -d' ' -f1; }
 fi
+# Line-ending-insensitive hash: checkouts may carry CRLF while git blobs
+# carry LF (core.autocrlf / text=auto). Strip CR bytes before hashing so
+# identical content compares equal on every platform.
+normsha() { tr -d '\r' <"$1" | sha256sum 2>/dev/null | cut -d' ' -f1; }
+if ! command -v sha256sum >/dev/null 2>&1; then
+  normsha() { tr -d '\r' <"$1" | shasum -a 256 | cut -d' ' -f1; }
+fi
 missing=0; changed=0; removed=0
 missing_list=""; changed_list=""; removed_list=""
 while IFS= read -r rel; do
@@ -53,7 +60,7 @@ while IFS= read -r rel; do
   if [ ! -f "$MIRROR/$rel" ]; then
     missing=$((missing+1)); missing_list="$missing_list $rel"; continue
   fi
-  a="$(shasum "$STAGE/$SUB/$rel")"; b="$(shasum "$MIRROR/$rel")"
+  a="$(normsha "$STAGE/$SUB/$rel")"; b="$(normsha "$MIRROR/$rel")"
   if [ "$a" != "$b" ]; then changed=$((changed+1)); changed_list="$changed_list $rel"; fi
 done <"$MANIFEST"
 while IFS= read -r rel; do
@@ -67,7 +74,9 @@ while IFS= read -r rel; do
 done <<EOF
 $(git -C "$MIRROR" ls-files)
 EOF
-root_hash="$(while IFS= read -r rel; do [ -n "$rel" ] || continue; printf '%s  %s\n' "$(shasum "$STAGE/$SUB/$rel")" "$rel"; done <"$MANIFEST" | shasum /dev/stdin 2>/dev/null || true)"
+HASHLIST="$STAGE/hashlist.txt"
+while IFS= read -r rel; do [ -n "$rel" ] || continue; printf '%s  %s\n' "$(normsha "$STAGE/$SUB/$rel")" "$rel"; done <"$MANIFEST" >"$HASHLIST"
+root_hash="$(shasum "$HASHLIST")"
 mirror_note="$(cat <<EOF
 # forge — downstream mirror
 

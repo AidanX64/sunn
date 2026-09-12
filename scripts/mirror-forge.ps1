@@ -40,13 +40,25 @@ function Invoke-Git($dir, [string[]]$gitArgs) {
     return $out
 }
 
-function Test-Preserved($relPath) {
-    if ($relPath -eq "MIRROR.md") { return $true }
+function Test-Preserved($relPath) {    if ($relPath -eq "MIRROR.md") { return $true }
     if ($relPath -like ".github/*") { return $true }
     if ($relPath -like "build/*" -or $relPath -like "target/*" -or $relPath -like "test/target/*") { return $true }
     if ($relPath -like "examples/*" -or $relPath -like ".scratch/*" -or $relPath -like ".opencode/*") { return $true }
     if ($relPath -like "*.exe" -or $relPath -like "*.o" -or $relPath -like "*.obj" -or $relPath -like "*.a" -or $relPath -like "*.lib") { return $true }
     return $false
+}
+
+# Line-ending-insensitive content hash: checkouts may carry CRLF while
+# git blobs carry LF (core.autocrlf / text=auto). Comparing raw bytes
+# would flag every text file on every mirror run.
+function Get-NormalizedHash([string]$LiteralPath) {
+    $bytes = [System.IO.File]::ReadAllBytes($LiteralPath)
+    $text = [System.Text.Encoding]::GetEncoding("iso-8859-1").GetString($bytes)
+    $norm = $text.Replace("`r`n", "`n")
+    $normBytes = [System.Text.Encoding]::GetEncoding("iso-8859-1").GetBytes($norm)
+    return [System.BitConverter]::ToString(
+        [System.Security.Cryptography.SHA256]::Create().ComputeHash($normBytes)
+    ).Replace("-", "").ToLower()
 }
 
 # Resolve and guard the canonical revision.
@@ -86,8 +98,8 @@ try {
         $src = Join-Path (Join-Path $staging $SourceSub) $rel
         $dst = Join-Path $MirrorPath $rel
         if (-not (Test-Path -LiteralPath $dst -PathType Leaf)) { $missing += $rel; continue }
-        $a = (Get-FileHash -LiteralPath $src -Algorithm SHA256).Hash
-        $b = (Get-FileHash -LiteralPath $dst -Algorithm SHA256).Hash
+        $a = Get-NormalizedHash -LiteralPath $src
+        $b = Get-NormalizedHash -LiteralPath $dst
         if ($a -ne $b) { $changed += $rel }
     }
     $sourceSet = @{}
@@ -98,7 +110,7 @@ try {
     $hashLines = @()
     foreach ($rel in ($sourceFiles | Sort-Object)) {
         $src = Join-Path (Join-Path $staging $SourceSub) $rel
-        $hashLines += "$((Get-FileHash -LiteralPath $src -Algorithm SHA256).Hash)  $rel"
+        $hashLines += "$(Get-NormalizedHash -LiteralPath $src)  $rel"
     }
     $rootHash = [System.BitConverter]::ToString(
         [System.Security.Cryptography.SHA256]::Create().ComputeHash(
@@ -115,10 +127,10 @@ try {
         "- Mirrored: $([DateTime]::UtcNow.ToString("yyyy-MM-dd")) (mirror-forge.ps1)",
         ""
     ) -join "`n"
-    $mirrorPath = Join-Path $MirrorPath "MIRROR.md"
+    $mirrorNotePath = Join-Path $MirrorPath "MIRROR.md"
     $mirrorDiffers = $true
-    if (Test-Path -LiteralPath $mirrorPath -PathType Leaf) {
-        $existing = [System.IO.File]::ReadAllText($mirrorPath)
+    if (Test-Path -LiteralPath $mirrorNotePath -PathType Leaf) {
+        $existing = [System.IO.File]::ReadAllText($mirrorNotePath)
         if ($existing -eq $mirrorMd) { $mirrorDiffers = $false }
     }
 
@@ -149,7 +161,7 @@ try {
         if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent | Out-Null }
         Copy-Item -LiteralPath $src -Destination $dst -Force
     }
-    [System.IO.File]::WriteAllText($mirrorPath, $mirrorMd, [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText($mirrorNotePath, $mirrorMd, [System.Text.UTF8Encoding]::new($false))
 
     if ($Commit -or $Push) {
         Invoke-Git $MirrorPath @("add", "-A") | Out-Null
